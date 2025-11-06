@@ -1,587 +1,1040 @@
--- Create a simple users tabler
-create table if not exists public.users (
-  id uuid primary key references auth.users(id) on delete cascade,
-  email text unique not null,
-  username text unique,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
+-- =====================================================================
+-- AUTO-POSTING APP — FULL SUPABASE POSTGRES SCHEMA + UTILITIES
+-- Includes:
+--   • Core schema (connections, content, scheduling, analytics, features)
+--   • RLS policies
+--   • Indexes & views
+--   • Partial unique index for dedupe
+--   • Hot→Cold retention for analytics_events + archive functions
+--   • Feature-builder (historic + future timeslots) with normalization
+--   • FIX: media array → join tables (posts_media, scheduled_posts_media)
+--   • FIX: UNIQUE index on mv_user_hourly_perf for concurrent refresh
+--   • FIX: Replace functional UNIQUE indexes with partial UNIQUE indexes
+-- =====================================================================
 
--- Enable Row Level Security
-alter table public.users enable row level security;
-
--- Create policies for the users table
-create policy "Users can view their own data"
-on public.users for select
-using (auth.uid() = id);
-
-create policy "Users can insert their own data"
-on public.users for insert
-with check (auth.uid() = id);
-
-create policy "Users can update their own data"
-on public.users for update
-using (auth.uid() = id);
-
--- Create function to handle new user signup
-create or replace function public.handle_new_user()
-returns trigger as $$
-begin
-  insert into public.users (id, email, username)
-  values (
-    new.id, 
-    new.email,
-    split_part(new.email, '@', 1) -- Use email prefix as username
-  );
-  return new;
-end;
-$$ language plpgsql security definer;
-
--- Create trigger to automatically create user record on signup
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute procedure public.handle_new_user();
-
-  -- =========================================================
--- 0) EXTENSIONS & ENUMS
--- =========================================================
+-- =========================
+-- EXTENSIONS
+-- =========================
 create extension if not exists "uuid-ossp";
-create extension if not exists pgcrypto;
+create extension if not exists "pgcrypto";
 
-do $$
+-- =========================
+-- ENUMS
+-- =========================
+do $$ begin
+  create type platform_enum as enum ('facebook','instagram');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type post_status_enum as enum ('draft','scheduled','posting','posted','failed','canceled');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type post_type_enum as enum ('image','video','reel','story','carousel','link');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type metric_enum as enum (
+    'impressions','reach','likes','comments','shares','saves',
+    'profile_visits','follows','clicks','video_views','engagement'
+  );
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type log_step_enum as enum ('recommend','explore','post','reward','error');
+exception when duplicate_object then null; end $$;
+
+-- =========================
+-- UTILS
+-- =========================
+create or replace function now_utc() returns timestamptz
+language sql stable as $$ select timezone('UTC', now()) $$;
+
+create or replace function set_updated_at() returns trigger
+language plpgsql as $$
 begin
-  if not exists (select 1 from pg_type where typname = 'user_role') then
-    create type user_role as enum ('user','faculty','admin');
-  end if;
-  if not exists (select 1 from pg_type where typname = 'post_status') then
-    create type post_status as enum ('draft','scheduled','published','failed','canceled');
-  end if;
+  new.updated_at = now_utc();
+  return new;
 end $$;
 
--- =========================================================
--- 1) USERS TABLE & TRIGGER
--- =========================================================
-create table if not exists public.users (
-  id uuid primary key references auth.users(id) on delete cascade,
-  email text unique not null,
-  username text unique,
-  role user_role not null default 'user',
-  full_name text,
-  avatar_url text,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+-- =========================
+-- CORE: USERS & CONNECTIONS
+-- =========================
+create table if not exists public.connected_meta_accounts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  page_id text,
+  page_name text,
+  ig_user_id text,
+  ig_username text,
+  access_token text not null,
+  token_expires_at timestamptz,
+  scopes text[],
+  created_at timestamptz not null default now_utc(),
+  updated_at timestamptz not null default now_utc()
 );
+create index if not exists idx_cma_user_platform on public.connected_meta_accounts(user_id, platform);
+create index if not exists idx_cma_token_expiry on public.connected_meta_accounts((token_expires_at));
 
--- Basic RLS
-alter table public.users enable row level security;
-create policy "Users can view own"
-  on public.users for select using (auth.uid() = id);
-create policy "Users can insert own"
-  on public.users for insert with check (auth.uid() = id);
-create policy "Users can update own"
-  on public.users for update using (auth.uid() = id);
+drop trigger if exists trg_cma_updated on public.connected_meta_accounts;
+create trigger trg_cma_updated before update on public.connected_meta_accounts
+for each row execute function set_updated_at();
 
--- updated_at trigger
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin new.updated_at := now(); return new; end $$;
-create trigger users_set_updated_at
-before update on public.users
-for each row execute function public.set_updated_at();
-
--- Signup trigger
-create or replace function public.handle_new_user()
-returns trigger as $$
-begin
-  insert into public.users (id, email, username)
-  values (new.id, new.email, split_part(new.email,'@',1))
-  on conflict (id) do nothing;
-  return new;
-end;
-$$ language plpgsql security definer;
-
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute procedure public.handle_new_user();
-
--- =========================================================
--- 2) ROLE HELPER FUNCTIONS (place *after* users table exists)
--- =========================================================
-create or replace function public.is_admin() returns boolean
-language sql stable as $$
-  select exists (
-    select 1 from public.users u
-    where u.id = auth.uid() and u.role = 'admin'::user_role
-  );
-$$;
-
-create or replace function public.is_faculty() returns boolean
-language sql stable as $$
-  select exists (
-    select 1 from public.users u
-    where u.id = auth.uid() and u.role = 'faculty'::user_role
-  );
-$$;
-
--- =========================================================
--- (Now you can safely create the rest of your schema:
---   social_platforms, social_accounts, media_assets,
---   posts, schedules, publications, analytics, etc.)
--- =========================================================
--- Extend your existing profile with role + display fields
-alter table public.users
-  add column if not exists role user_role not null default 'user',
-  add column if not exists full_name text,
-  add column if not exists avatar_url text;
-
--- Keep your triggers/policies; add an updated_at auto-touch
-drop trigger if exists users_set_updated_at on public.users;
-create trigger users_set_updated_at
-before update on public.users
-for each row execute function public.set_updated_at();
-
--- 2.1) Reference social platforms (Twitter/X, Facebook, IG, TikTok, etc.)
-create table if not exists public.social_platforms (
-  id uuid primary key default uuid_generate_v4(),
-  name text unique not null,         -- 'facebook', 'instagram', 'x', 'tiktok', etc.
-  api_base_url text,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+create table if not exists public.oauth_state (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  state text not null,
+  code_verifier text,
+  created_at timestamptz not null default now_utc(),
+  expires_at timestamptz not null
 );
-create trigger social_platforms_set_updated_at
-before update on public.social_platforms
-for each row execute function public.set_updated_at();
+create index if not exists idx_oauth_state_user_platform on public.oauth_state(user_id, platform);
+create index if not exists idx_oauth_state_expires on public.oauth_state(expires_at);
 
--- 2.2) A user's connected social account per platform
-create table if not exists public.social_accounts (
-  id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.users(id) on delete cascade,
-  platform_id uuid not null references public.social_platforms(id) on delete restrict,
-  handle text,                       -- @yourbrand
-  external_account_id text,          -- platform-side id
-  status text default 'active',      -- 'active','revoked','expired'
-  -- NEVER store raw tokens in plain text in production; put them in Vault or an external secrets store.
-  token_identifier text,             -- pointer to secret (e.g., vault key)
-  created_at timestamptz default now(),
-  updated_at timestamptz default now(),
-  unique (user_id, platform_id)
-);
-create index if not exists idx_social_accounts_user on public.social_accounts(user_id);
-create trigger social_accounts_set_updated_at
-before update on public.social_accounts
-for each row execute function public.set_updated_at();
-
-alter table public.social_accounts enable row level security;
-
-drop policy if exists "own social_accounts select" on public.social_accounts;
-create policy "own social_accounts select"
-on public.social_accounts for select
-using (auth.uid() = user_id or public.is_admin());
-
-drop policy if exists "own social_accounts write" on public.social_accounts;
-create policy "own social_accounts write"
-on public.social_accounts for all
-using (auth.uid() = user_id or public.is_admin())
-with check (auth.uid() = user_id or public.is_admin());
-
-
+-- =========================
+-- CONTENT AUTHORING
+-- =========================
 create table if not exists public.media_assets (
-  id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.users(id) on delete cascade,
-  storage_path text not null,        -- e.g., 'public/posts/abc123.jpg' (store in Supabase Storage)
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  storage_path text not null,
+  public_url text,
+  width int,
+  height int,
+  duration_ms int,
   mime_type text,
-  file_size bigint,
-  checksum text,                     -- optional integrity check
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  checksum bytea,
+  created_at timestamptz not null default now_utc()
 );
-create index if not exists idx_media_assets_user on public.media_assets(user_id);
-create trigger media_assets_set_updated_at
-before update on public.media_assets
-for each row execute function public.set_updated_at();
+create index if not exists idx_media_user_created on public.media_assets(user_id, created_at desc);
+
+create table if not exists public.captions_library (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  title text,
+  body text not null,
+  hashtags text[],
+  created_at timestamptz not null default now_utc(),
+  updated_at timestamptz not null default now_utc()
+);
+drop trigger if exists trg_caps_updated on public.captions_library;
+create trigger trg_caps_updated before update on public.captions_library
+for each row execute function set_updated_at();
+
+-- POSTS (no array FK; use join table below)
+create table if not exists public.posts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  title text,
+  caption text,
+  post_type post_type_enum not null default 'image',
+  tags text[],
+  created_at timestamptz not null default now_utc(),
+  updated_at timestamptz not null default now_utc()
+);
+create index if not exists idx_posts_user_created on public.posts(user_id, created_at desc);
+drop trigger if exists trg_posts_updated on public.posts;
+create trigger trg_posts_updated before update on public.posts
+for each row execute function set_updated_at();
+
+-- If an earlier run created posts.media_ids (uuid[]) drop it
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema='public' and table_name='posts' and column_name='media_ids'
+  ) then
+    alter table public.posts drop column media_ids;
+  end if;
+end$$;
+
+-- =========================
+-- SCHEDULING + PUBLICATION
+-- =========================
+create table if not exists public.scheduled_posts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  target_id text not null,
+  post_id uuid references public.posts(id) on delete set null,
+  caption text,
+  post_type post_type_enum not null default 'image',
+  status post_status_enum not null default 'draft',
+  recommended_score numeric,
+  scheduled_at timestamptz,
+  posted_at timestamptz,
+  api_post_id text,
+  permalink text,
+  error_message text,
+  created_at timestamptz not null default now_utc(),
+  updated_at timestamptz not null default now_utc()
+);
+create index if not exists idx_sched_user_status_time on public.scheduled_posts(user_id, status, scheduled_at);
+create index if not exists idx_sched_user_created on public.scheduled_posts(user_id, created_at desc);
+create index if not exists idx_sched_platform_target on public.scheduled_posts(platform, target_id);
+drop trigger if exists trg_sched_updated on public.scheduled_posts;
+create trigger trg_sched_updated before update on public.scheduled_posts
+for each row execute function set_updated_at();
+
+-- If an earlier run created scheduled_posts.media_ids (uuid[]) drop it
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema='public' and table_name='scheduled_posts' and column_name='media_ids'
+  ) then
+    alter table public.scheduled_posts drop column media_ids;
+  end if;
+end$$;
+
+-- PARTIAL UNIQUE (dedupe accidental double schedules while pending)
+create unique index if not exists uq_scheduled_dedup
+  on public.scheduled_posts (user_id, platform, scheduled_at, post_id)
+  where status in ('scheduled','posting');
+
+-- Optional dedupe guard for schedules without a post_id (commented)
+-- create unique index if not exists uq_sched_dedup_nodraft
+--   on public.scheduled_posts (user_id, platform, scheduled_at, md5(coalesce(caption,'')))
+--   where status in ('scheduled','posting') and post_id is null;
+
+create table if not exists public.post_logs (
+  id bigserial primary key,
+  scheduled_post_id uuid references public.scheduled_posts(id) on delete cascade,
+  step log_step_enum not null,
+  request_summary jsonb,
+  response_summary jsonb,
+  reward numeric,
+  created_at timestamptz not null default now_utc()
+);
+create index if not exists idx_postlogs_sched_created on public.post_logs(scheduled_post_id, created_at desc);
+create index if not exists idx_postlogs_step_created on public.post_logs(step, created_at desc);
+
+-- =========================
+-- MEDIA JOIN TABLES (ordered)
+-- =========================
+create table if not exists public.posts_media (
+  id bigserial primary key,
+  post_id uuid not null references public.posts(id) on delete cascade,
+  media_id uuid not null references public.media_assets(id) on delete cascade,
+  position int not null default 1,
+  created_at timestamptz not null default now_utc()
+);
+create unique index if not exists uq_posts_media_unique
+  on public.posts_media(post_id, media_id);
+create unique index if not exists uq_posts_media_position
+  on public.posts_media(post_id, position);
+create index if not exists idx_posts_media_post_pos
+  on public.posts_media(post_id, position);
+
+create table if not exists public.scheduled_posts_media (
+  id bigserial primary key,
+  scheduled_post_id uuid not null references public.scheduled_posts(id) on delete cascade,
+  media_id uuid not null references public.media_assets(id) on delete restrict,
+  position int not null default 1,
+  created_at timestamptz not null default now_utc()
+);
+create unique index if not exists uq_sched_media_unique
+  on public.scheduled_posts_media(scheduled_post_id, media_id);
+create unique index if not exists uq_sched_media_position
+  on public.scheduled_posts_media(scheduled_post_id, position);
+create index if not exists idx_sched_media_sched_pos
+  on public.scheduled_posts_media(scheduled_post_id, position);
+
+-- =========================
+-- ANALYTICS (HOT)
+-- =========================
+create table if not exists public.analytics_events (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  object_id text,
+  metric metric_enum not null,
+  value numeric not null,
+  ts timestamptz not null
+);
+create index if not exists idx_analytics_user_ts on public.analytics_events(user_id, ts desc);
+create index if not exists idx_analytics_object_metric on public.analytics_events(object_id, metric);
+
+-- =========================
+-- ANALYTICS COLD ARCHIVE + UNION VIEW + ARCHIVE FUNCTIONS
+-- =========================
+create table if not exists public.analytics_events_cold (
+  like public.analytics_events including all
+);
+create index if not exists analytics_cold_ts_idx
+  on public.analytics_events_cold (user_id, ts desc);
+
+create or replace view public.v_analytics_events_all as
+  select * from public.analytics_events
+  union all
+  select * from public.analytics_events_cold;
+
+create or replace function public.archive_analytics_events(months_old int default 6)
+returns json language plpgsql security definer as $$
+declare
+  cutoff timestamptz := now() - make_interval(months => months_old);
+  moved bigint;
+  deleted bigint;
+begin
+  insert into public.analytics_events_cold
+  select * from public.analytics_events
+  where ts < cutoff;
+  get diagnostics moved = row_count;
+
+  delete from public.analytics_events
+  where ts < cutoff;
+  get diagnostics deleted = row_count;
+
+  return json_build_object('moved', moved, 'deleted', deleted, 'cutoff', cutoff);
+end $$;
+
+create or replace function public.archive_analytics_events_6m()
+returns json language sql security definer as $$
+  select public.archive_analytics_events(6);
+$$;
+
+-- =========================
+-- FEATURE STORE
+-- =========================
+create table if not exists public.features_engagement_timeslots (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  timeslot timestamptz not null,
+  dow int not null check (dow between 0 and 6),
+  hour int not null check (hour between 0 and 23),
+  is_weekend boolean generated always as (dow in (0,6)) stored,
+  is_holiday boolean default false,
+  post_type post_type_enum,
+  audience_segment_id int,
+  seasonal_daily double precision,
+  seasonal_weekly double precision,
+  recent_avg_engagement numeric,
+  user_recent_avg_7d numeric,
+  hour_dow_ctr_28d numeric,
+  post_type_ctr_14d numeric,
+  label_engagement numeric,
+  created_at timestamptz not null default now_utc()
+);
+
+-- (IMMUTABILITY-SAFE) UNIQUE constraints for timeslots:
+-- Replace functional unique (with COALESCE) by partial uniques
+drop index if exists uq_timeslot_user_platform;
+
+-- Case A: post_type IS NULL -> unique on (user_id, platform, timeslot)
+create unique index if not exists uq_feats_timeslot_null
+  on public.features_engagement_timeslots (user_id, platform, timeslot)
+  where post_type is null;
+
+-- Case B: post_type IS NOT NULL -> unique on (user_id, platform, timeslot, post_type)
+create unique index if not exists uq_feats_timeslot_pt
+  on public.features_engagement_timeslots (user_id, platform, timeslot, post_type)
+  where post_type is not null;
+
+create index if not exists idx_feats_user_created on public.features_engagement_timeslots(user_id, created_at desc);
+
+-- For fast future scoring lookups
+create index if not exists idx_feats_future_lookup
+  on public.features_engagement_timeslots (user_id, platform, timeslot)
+  where label_engagement is null;
+
+-- Materialized rollup for heatmaps
+create materialized view if not exists public.mv_user_hourly_perf as
+select
+  user_id,
+  platform,
+  dow,
+  hour,
+  avg(label_engagement) as avg_engagement,
+  count(*) as n
+from public.features_engagement_timeslots
+group by 1,2,3,4;
+
+-- UNIQUE index required for REFRESH CONCURRENTLY
+do $$
+begin
+  perform 1
+  from pg_indexes
+  where schemaname = 'public' and indexname = 'uq_mv_hourly_perf';
+  if not found then
+    create unique index uq_mv_hourly_perf
+      on public.mv_user_hourly_perf(user_id, platform, dow, hour);
+  end if;
+end$$;
+
+-- =========================
+-- SEGMENTATION
+-- =========================
+create table if not exists public.audience_segments (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  segment_id int not null,
+  size int,
+  summary jsonb,
+  updated_at timestamptz not null default now_utc()
+);
+create unique index if not exists uq_segments_user_segment on public.audience_segments(user_id, segment_id);
+
+-- =========================
+-- BANDIT (Contextual Thompson Sampling)
+-- =========================
+create table if not exists public.bandit_contexts (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  segment_id int,
+  weekday int check (weekday between 0 and 6),
+  hour_block int check (hour_block between 0 and 23),
+  post_type post_type_enum,
+  prior_success double precision not null default 1.0,
+  prior_failure double precision not null default 1.0,
+  updated_at timestamptz not null default now_utc()
+);
+
+-- (IMMUTABILITY-SAFE) UNIQUE constraints replacing COALESCE on nullable cols
+drop index if exists uq_bandit_ctx;
+
+-- 1) segment_id NULL, post_type NULL
+create unique index if not exists uq_bandit_ctx_segnull_ptnull
+  on public.bandit_contexts (user_id, platform, weekday, hour_block)
+  where segment_id is null and post_type is null;
+
+-- 2) segment_id NULL, post_type NOT NULL
+create unique index if not exists uq_bandit_ctx_segnull_pt
+  on public.bandit_contexts (user_id, platform, weekday, hour_block, post_type)
+  where segment_id is null and post_type is not null;
+
+-- 3) segment_id NOT NULL, post_type NULL
+create unique index if not exists uq_bandit_ctx_seg_ptnull
+  on public.bandit_contexts (user_id, platform, segment_id, weekday, hour_block)
+  where segment_id is not null and post_type is null;
+
+-- 4) segment_id NOT NULL, post_type NOT NULL
+create unique index if not exists uq_bandit_ctx_seg_pt
+  on public.bandit_contexts (user_id, platform, segment_id, weekday, hour_block, post_type)
+  where segment_id is not null and post_type is not null;
+
+create index if not exists idx_bandit_ctx_updated on public.bandit_contexts(user_id, updated_at desc);
+
+create table if not exists public.bandit_rewards (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  context_id bigint references public.bandit_contexts(id) on delete cascade,
+  scheduled_post_id uuid references public.scheduled_posts(id) on delete set null,
+  reward numeric not null,
+  created_at timestamptz not null default now_utc()
+);
+create index if not exists idx_bandit_rewards_user_created on public.bandit_rewards(user_id, created_at desc);
+
+-- =========================
+-- MODEL REGISTRY & CACHE
+-- =========================
+create table if not exists public.model_registry (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  model_name text not null,
+  version text not null,
+  artifact_url text not null,
+  metrics jsonb,
+  created_at timestamptz not null default now_utc()
+);
+create index if not exists idx_model_registry_user_model on public.model_registry(user_id, model_name, created_at desc);
+
+create table if not exists public.recommendations_cache (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  generated_at timestamptz not null default now_utc(),
+  horizon_days int not null default 14,
+  payload jsonb not null
+);
+create index if not exists idx_rec_cache_user_platform on public.recommendations_cache(user_id, platform, generated_at desc);
+
+-- =========================
+-- OPS / WEBHOOKS / AUDIT
+-- =========================
+create table if not exists public.jobs (
+  id bigserial primary key,
+  job_name text not null,
+  status text not null check (status in ('queued','running','success','error')),
+  started_at timestamptz default now_utc(),
+  finished_at timestamptz,
+  details jsonb
+);
+create index if not exists idx_jobs_name_started on public.jobs(job_name, started_at desc);
+
+create table if not exists public.webhooks_meta (
+  id uuid primary key default gen_random_uuid(),
+  platform platform_enum not null,
+  verify_token text not null,
+  created_at timestamptz not null default now_utc()
+);
+
+create table if not exists public.audit_logs (
+  id bigserial primary key,
+  user_id uuid references auth.users(id) on delete set null,
+  action text not null,
+  entity text,
+  entity_id text,
+  meta jsonb,
+  created_at timestamptz not null default now_utc()
+);
+create index if not exists idx_audit_user_created on public.audit_logs(user_id, created_at desc);
+
+-- =========================
+-- RLS (Row Level Security)
+-- =========================
+alter table public.connected_meta_accounts enable row level security;
+alter table public.oauth_state enable row level security;
 
 alter table public.media_assets enable row level security;
-
-create policy "own media view"
-on public.media_assets for select
-using (auth.uid() = user_id or public.is_admin() or public.is_faculty());
-
-create policy "own media write"
-on public.media_assets for all
-using (auth.uid() = user_id or public.is_admin())
-with check (auth.uid() = user_id or public.is_admin());
-
-
--- 4.1) Posts (content authored by a user)
-create table if not exists public.posts (
-  id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.users(id) on delete cascade,
-  title text,
-  body text,                          -- caption / content
-  status post_status not null default 'draft',
-  target_platform_ids uuid[] default '{}',  -- which platforms to publish to
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-create index if not exists idx_posts_user on public.posts(user_id);
-create index if not exists idx_posts_status on public.posts(status);
-create trigger posts_set_updated_at
-before update on public.posts
-for each row execute function public.set_updated_at();
-
--- Assets attached to a post
-create table if not exists public.post_assets (
-  post_id uuid not null references public.posts(id) on delete cascade,
-  asset_id uuid not null references public.media_assets(id) on delete restrict,
-  primary key(post_id, asset_id)
-);
-
--- Row-Level Security
+alter table public.captions_library enable row level security;
 alter table public.posts enable row level security;
-alter table public.post_assets enable row level security;
 
-create policy "own posts read"
-on public.posts for select
-using (auth.uid() = user_id or public.is_admin() or public.is_faculty());  -- faculty view-only
+alter table public.scheduled_posts enable row level security;
+alter table public.post_logs enable row level security;
 
-create policy "own posts write"
-on public.posts for all
-using (auth.uid() = user_id or public.is_admin())
-with check (auth.uid() = user_id or public.is_admin());
+alter table public.posts_media enable row level security;
+alter table public.scheduled_posts_media enable row level security;
 
-create policy "post_assets read"
-on public.post_assets for select
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = post_assets.post_id
-      and (p.user_id = auth.uid() or public.is_admin() or public.is_faculty())
-  )
-);
+alter table public.analytics_events enable row level security;
+alter table public.analytics_events_cold enable row level security;
+alter table public.features_engagement_timeslots enable row level security;
 
-create policy "post_assets write"
-on public.post_assets for all
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = post_assets.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-)
-with check (
-  exists (
-    select 1 from public.posts p
-    where p.id = post_assets.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-);
+alter table public.audience_segments enable row level security;
+alter table public.bandit_contexts enable row level security;
+alter table public.bandit_rewards enable row level security;
 
--- 4.2) Schedules (one post may have multiple scheduled runs)
-create table if not exists public.schedules (
-  id uuid primary key default uuid_generate_v4(),
-  post_id uuid not null references public.posts(id) on delete cascade,
-  scheduled_at timestamptz not null,
-  timezone text default 'Asia/Manila',
-  recurrence text,                     -- optional RRULE string
-  created_by uuid not null references public.users(id) on delete cascade,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-create index if not exists idx_schedules_post on public.schedules(post_id);
-create index if not exists idx_schedules_time on public.schedules(scheduled_at);
-create trigger schedules_set_updated_at
-before update on public.schedules
-for each row execute function public.set_updated_at();
+alter table public.model_registry enable row level security;
+alter table public.recommendations_cache enable row level security;
 
-alter table public.schedules enable row level security;
+alter table public.jobs enable row level security;
+alter table public.webhooks_meta enable row level security;
+alter table public.audit_logs enable row level security;
 
-create policy "own schedules read"
-on public.schedules for select
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = schedules.post_id
-      and (p.user_id = auth.uid() or public.is_admin() or public.is_faculty())
-  )
-);
+-- Admin-close ops tables by default
+do $$
+begin
+  begin
+    create policy jobs_no_access on public.jobs for all using (false);
+  exception when duplicate_object then null; end;
 
-create policy "own schedules write"
-on public.schedules for all
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = schedules.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-)
-with check (
-  exists (
-    select 1 from public.posts p
-    where p.id = schedules.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-);
+  begin
+    create policy webhooks_no_access on public.webhooks_meta for all using (false);
+  exception when duplicate_object then null; end;
 
--- 4.3) Publications (actual per-platform attempts/results)
-create table if not exists public.publications (
-  id uuid primary key default uuid_generate_v4(),
-  post_id uuid not null references public.posts(id) on delete cascade,
-  social_account_id uuid references public.social_accounts(id) on delete set null,
-  platform_id uuid not null references public.social_platforms(id) on delete restrict,
-  scheduled_id uuid references public.schedules(id) on delete set null,
-  published_at timestamptz,
-  status post_status not null default 'scheduled',
-  external_post_id text,
-  external_url text,
-  error_message text,                  -- if failed
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-create index if not exists idx_publications_post on public.publications(post_id);
-create index if not exists idx_publications_platform on public.publications(platform_id);
-create trigger publications_set_updated_at
-before update on public.publications
-for each row execute function public.set_updated_at();
+  begin
+    create policy audit_no_access on public.audit_logs for all using (false);
+  exception when duplicate_object then null; end;
+end$$;
 
-alter table public.publications enable row level security;
+-- User-scoped policies
+do $$
+begin
+  begin
+    create policy cma_user_rw on public.connected_meta_accounts
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-create policy "own publications read"
-on public.publications for select
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = public.publications.post_id
-      and (p.user_id = auth.uid() or public.is_admin() or public.is_faculty())
-  )
-);
+  begin
+    create policy oauth_user_rw on public.oauth_state
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-create policy "own publications write"
-on public.publications for all
-using (
-  exists (
-    select 1 from public.posts p
-    where p.id = public.publications.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-)
-with check (
-  exists (
-    select 1 from public.posts p
-    where p.id = public.publications.post_id
-      and (p.user_id = auth.uid() or public.is_admin())
-  )
-);
+  begin
+    create policy assets_user_rw on public.media_assets
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
+  begin
+    create policy caps_user_rw on public.captions_library
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
--- 5.1) Metrics captured per publication (per pull or webhook)
-create table if not exists public.analytics_metrics (
-  id uuid primary key default uuid_generate_v4(),
-  publication_id uuid not null references public.publications(id) on delete cascade,
-  platform_id uuid not null references public.social_platforms(id) on delete restrict,
-  captured_at timestamptz not null default now(),
-  impressions integer,
-  reach integer,
-  likes integer,
-  comments integer,
-  shares integer,
-  saves integer,
-  clicks integer,
-  video_views integer,
-  followers_delta integer,
-  engagement_rate numeric(6,4),  -- precomputed if you like
-  raw jsonb                      -- optional raw payload
-);
-create index if not exists idx_analytics_pub on public.analytics_metrics(publication_id);
-create index if not exists idx_analytics_time on public.analytics_metrics(captured_at);
+  begin
+    create policy posts_user_rw on public.posts
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-alter table public.analytics_metrics enable row level security;
+  begin
+    create policy sched_user_rw on public.scheduled_posts
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-create policy "analytics read (owner/faculty/admin)"
-on public.analytics_metrics for select
-using (
-  exists (
-    select 1
-    from public.publications pub
-    join public.posts p on p.id = pub.post_id
-    where pub.id = analytics_metrics.publication_id
-      and (p.user_id = auth.uid() or public.is_admin() or public.is_faculty())
-  )
-);
+  begin
+    create policy postlogs_user_ro on public.post_logs
+      for select using (
+        auth.uid() in (select user_id from public.scheduled_posts sp where sp.id = scheduled_post_id)
+      );
+  exception when duplicate_object then null; end;
 
--- 5.2) Segments definition and (optional) members
-create table if not exists public.segments (
-  id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.users(id) on delete cascade,
-  name text not null,
-  definition jsonb not null,  -- store rules/filters used to compute the segment
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-create trigger segments_set_updated_at
-before update on public.segments
-for each row execute function public.set_updated_at();
-create index if not exists idx_segments_user on public.segments(user_id);
+  begin
+    create policy postlogs_user_write on public.post_logs
+      for insert with check (true);
+  exception when duplicate_object then null; end;
 
-alter table public.segments enable row level security;
+  begin
+    create policy posts_media_user_rw on public.posts_media
+      for all using (
+        auth.uid() in (select p.user_id from public.posts p where p.id = post_id)
+      )
+      with check (
+        auth.uid() in (select p.user_id from public.posts p where p.id = post_id)
+      );
+  exception when duplicate_object then null; end;
 
-create policy "segments read"
-on public.segments for select
-using (auth.uid() = user_id or public.is_admin() or public.is_faculty());
+  begin
+    create policy sched_media_user_rw on public.scheduled_posts_media
+      for all using (
+        auth.uid() in (select sp.user_id from public.scheduled_posts sp where sp.id = scheduled_post_id)
+      )
+      with check (
+        auth.uid() in (select sp.user_id from public.scheduled_posts sp where sp.id = scheduled_post_id)
+      );
+  exception when duplicate_object then null; end;
 
-create policy "segments write"
-on public.segments for all
-using (auth.uid() = user_id or public.is_admin())
-with check (auth.uid() = user_id or public.is_admin());
+  begin
+    create policy analytics_user_rw on public.analytics_events
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
--- Optional: audience members captured from platforms
-create table if not exists public.segment_members (
-  segment_id uuid not null references public.segments(id) on delete cascade,
-  platform_id uuid not null references public.social_platforms(id) on delete restrict,
-  external_user_id text not null,
-  attributes jsonb,  -- snapshot of public attributes (avoid PII)
-  primary key (segment_id, platform_id, external_user_id)
-);
-alter table public.segment_members enable row level security;
+  begin
+    create policy analytics_cold_user_rw on public.analytics_events_cold
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-create policy "segment_members read"
-on public.segment_members for select
-using (
-  exists (
-    select 1 from public.segments s
-    where s.id = segment_members.segment_id
-      and (s.user_id = auth.uid() or public.is_admin() or public.is_faculty())
-  )
-);
+  begin
+    create policy feats_user_rw on public.features_engagement_timeslots
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
 
-create policy "segment_members write"
-on public.segment_members for all
-using (
-  exists (
-    select 1 from public.segments s
-    where s.id = segment_members.segment_id
-      and (s.user_id = auth.uid() or public.is_admin())
-  )
-)
-with check (
-  exists (
-    select 1 from public.segments s
-    where s.id = segment_members.segment_id
-      and (s.user_id = auth.uid() or public.is_admin())
-  )
-);
+  begin
+    create policy seg_user_rw on public.audience_segments
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
+
+  begin
+    create policy bandit_ctx_user_rw on public.bandit_contexts
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
+
+  begin
+    create policy bandit_r_user_rw on public.bandit_rewards
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
+
+  begin
+    create policy modelreg_user_rw on public.model_registry
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
+
+  begin
+    create policy rec_cache_user_rw on public.recommendations_cache
+      for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  exception when duplicate_object then null; end;
+end$$;
 
 
-create table if not exists public.notifications (
-  id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.users(id) on delete cascade, -- recipient
-  type text not null,                   -- 'schedule_due','post_published','post_failed','evaluation_request', etc.
-  payload jsonb,                        -- lightweight details
-  read_at timestamptz,
-  created_at timestamptz default now()
-);
-create index if not exists idx_notifications_user on public.notifications(user_id);
-alter table public.notifications enable row level security;
+-- =========================
+-- INDEXING HINTS
+-- =========================
+create index if not exists idx_sched_due on public.scheduled_posts(status, scheduled_at)
+  where status in ('scheduled','posting');
 
-create policy "notifications read (recipient or admin)"
-on public.notifications for select
-using (auth.uid() = user_id or public.is_admin());
+create index if not exists idx_analytics_ts on public.analytics_events(user_id, ts desc);
 
-create policy "notifications write (system/admin)"
-on public.notifications for insert
-with check (auth.uid() = user_id or public.is_admin());
+create index if not exists idx_feats_dow_hour on public.features_engagement_timeslots(user_id, platform, dow, hour);
 
--- Optional: allow updates to mark as read
-create policy "notifications mark read"
-on public.notifications for update
-using (auth.uid() = user_id or public.is_admin())
-with check (auth.uid() = user_id or public.is_admin());
-
-
-create table if not exists public.system_logs (
-  id bigserial primary key,
-  actor_id uuid,                         -- nullable for background jobs
-  actor_role user_role,
-  action text not null,                  -- 'create_post','publish_attempt','metrics_pull', etc.
-  entity text,                           -- 'post','publication','schedule','segment' ...
-  entity_id uuid,
-  details jsonb,
-  created_at timestamptz default now()
-);
-create index if not exists idx_system_logs_entity on public.system_logs(entity, entity_id);
-create index if not exists idx_system_logs_time on public.system_logs(created_at);
-
-alter table public.system_logs enable row level security;
-
--- Admin sees all; users see summarized logs about their own entities; faculty see summaries
-create policy "system_logs read (owner/faculty/admin)"
-on public.system_logs for select
-using (
-  public.is_admin()
-  or public.is_faculty()
-  or exists (
-    -- tie logs back to user's content (posts/publications/schedules)
-    select 1
-    from public.posts p
-    where p.id = system_logs.entity_id and p.user_id = auth.uid()
-  )
-  or exists (
-    select 1
-    from public.publications pub
-    join public.posts p on p.id = pub.post_id
-    where pub.id = system_logs.entity_id and p.user_id = auth.uid()
-  )
-);
-
-
--- If you’d like faculty as a true role, we already added role='faculty' to users.
--- This table requests a faculty member to review a post/publication.
-
-create table if not exists public.evaluation_requests (
-  id uuid primary key default uuid_generate_v4(),
-  requested_by uuid not null references public.users(id) on delete cascade,  -- the owner/user
-  faculty_id uuid not null references public.users(id) on delete cascade,    -- must have role='faculty'
-  post_id uuid references public.posts(id) on delete cascade,
-  publication_id uuid references public.publications(id) on delete cascade,
-  status text not null default 'pending',  -- 'pending','reviewed','declined'
-  notes text,
-  created_at timestamptz default now(),
-  responded_at timestamptz
-);
-create index if not exists idx_eval_faculty on public.evaluation_requests(faculty_id);
-create index if not exists idx_eval_post on public.evaluation_requests(post_id);
-
-alter table public.evaluation_requests enable row level security;
-
--- Requester can create & read their requests; assigned faculty can read/update status/notes; admin full
-create policy "evaluation requester read"
-on public.evaluation_requests for select
-using (requested_by = auth.uid() or faculty_id = auth.uid() or public.is_admin());
-
-create policy "evaluation requester create"
-on public.evaluation_requests for insert
-with check (requested_by = auth.uid() or public.is_admin());
-
-create policy "evaluation requester update own"
-on public.evaluation_requests for update
-using (requested_by = auth.uid() or public.is_admin() or faculty_id = auth.uid())
-with check (requested_by = auth.uid() or public.is_admin() or faculty_id = auth.uid());
-
-create or replace view public.v_post_analytics_summary as
+-- =========================
+-- VIEWS (Developer-friendly)
+-- =========================
+create or replace view public.v_user_recent_engagement as
 select
-  p.user_id,
-  p.id as post_id,
-  coalesce(sum(am.impressions),0) as impressions,
-  coalesce(sum(am.reach),0) as reach,
-  coalesce(sum(am.likes),0) as likes,
-  coalesce(sum(am.comments),0) as comments,
-  coalesce(sum(am.shares),0) as shares,
-  coalesce(sum(am.clicks),0) as clicks,
-  count(distinct am.publication_id) as datapoints
-from public.posts p
-left join public.publications pub on pub.post_id = p.id
-left join public.analytics_metrics am on am.publication_id = pub.id
-group by 1,2;
+  user_id,
+  platform,
+  date_trunc('day', ts) as day,
+  sum(case when metric = 'engagement' then value else 0 end) as engagement,
+  sum(case when metric = 'impressions' then value else 0 end) as impressions
+from public.v_analytics_events_all
+group by 1,2,3;
 
--- Optional RLS via a SECURITY-BARRIER view pattern: wrap with a SECURITY INVOKER function if needed.
+create or replace view public.v_best_time_slots as
+select
+  user_id, platform, dow, hour,
+  avg(label_engagement) as predicted_avg
+from public.features_engagement_timeslots
+group by 1,2,3,4
+order by predicted_avg desc;
+
+-- Media-as-array helper views (ordered)
+create or replace view public.v_posts_with_media as
+select
+  p.*,
+  coalesce(
+    (select array_agg(pm.media_id order by pm.position)
+     from public.posts_media pm
+     where pm.post_id = p.id),
+    '{}'
+  ) as media_ids
+from public.posts p;
+
+create or replace view public.v_scheduled_posts_with_media as
+select
+  sp.*,
+  coalesce(
+    (select array_agg(spm.media_id order by spm.position)
+     from public.scheduled_posts_media spm
+     where spm.scheduled_post_id = sp.id),
+    '{}'
+  ) as media_ids
+from public.scheduled_posts sp;
+
+-- =========================
+-- HELPERS & FEATURE BUILDER
+-- =========================
+create or replace function public.norm_engagement(
+  e numeric, p10 numeric, p90 numeric
+) returns numeric language sql immutable as $$
+  select greatest(0, least(1, (e - p10) / nullif(p90 - p10, 0)))
+$$;
+
+create or replace function public.build_timeslot_features(
+  p_user_id uuid,
+  p_platform platform_enum,
+  p_history_days int default 90,
+  p_future_days int default 14
+) returns json language plpgsql security definer as $$
+declare
+  history_start timestamptz := now() - make_interval(days => p_history_days);
+  history_end   timestamptz := now();
+  future_end    timestamptz := now() + make_interval(days => p_future_days);
+  ins_hist bigint; ins_future bigint;
+begin
+  -- HISTORICAL (labels)
+  with hist as (
+    select
+      p_user_id                  as user_id,
+      p_platform                 as platform,
+      date_trunc('hour', ts)     as timeslot,
+      extract(dow  from ts)::int as dow,
+      extract(hour from ts)::int as hour,
+      sum(case when metric = 'likes'    then value else 0 end) as likes,
+      sum(case when metric = 'comments' then value else 0 end) as comments,
+      sum(case when metric = 'saves'    then value else 0 end) as saves,
+      sum(case when metric = 'shares'   then value else 0 end) as shares,
+      sum(case when metric = 'impressions' then value else 0 end) as impressions
+    from public.v_analytics_events_all
+    where user_id = p_user_id
+      and platform = p_platform
+      and ts >= history_start
+      and ts <  history_end
+    group by 1,2,3,4,5
+  ),
+  hist_e as (
+    select
+      user_id, platform, timeslot, dow, hour,
+      (likes + comments + 0.5*saves + 0.2*shares) as engagement
+    from hist
+  ),
+  bounds as (
+    select
+      user_id, platform,
+      percentile_cont(0.10) within group (order by engagement) as p10,
+      percentile_cont(0.90) within group (order by engagement) as p90
+    from hist_e
+    group by 1,2
+  ),
+  hist_norm as (
+    select
+      h.user_id, h.platform, h.timeslot, h.dow, h.hour,
+      public.norm_engagement(h.engagement, b.p10, b.p90) as label_engagement
+    from hist_e h
+    join bounds b using (user_id, platform)
+  ),
+  recency as (
+    select
+      p_user_id as user_id,
+      p_platform as platform,
+      extract(dow  from ts)::int as dow,
+      extract(hour from ts)::int as hour,
+      avg(case when metric = 'engagement' then value else null end) filter (where metric='engagement') as avg_engagement_hour_dow,
+      avg(case when metric = 'impressions' then value else null end) filter (where metric='impressions') as avg_impr_hour_dow
+    from public.v_analytics_events_all
+    where user_id = p_user_id
+      and platform = p_platform
+      and ts >= history_start
+      and ts <  history_end
+    group by 1,2,3,4
+  )
+  insert into public.features_engagement_timeslots (
+    user_id, platform, timeslot, dow, hour,
+    is_holiday, post_type, audience_segment_id,
+    seasonal_daily, seasonal_weekly,
+    recent_avg_engagement, user_recent_avg_7d,
+    hour_dow_ctr_28d, post_type_ctr_14d,
+    label_engagement
+  )
+  select
+    h.user_id, h.platform, h.timeslot, h.dow, h.hour,
+    false as is_holiday,
+    null::post_type_enum as post_type,
+    null::int as audience_segment_id,
+    sin(2*pi()*h.hour/24.0)::float8 as seasonal_daily,
+    sin(2*pi()*h.dow/7.0)::float8  as seasonal_weekly,
+    r.avg_engagement_hour_dow as recent_avg_engagement,
+    r.avg_engagement_hour_dow as user_recent_avg_7d,
+    case when r.avg_impr_hour_dow is null or r.avg_impr_hour_dow = 0
+      then null
+      else (r.avg_engagement_hour_dow / r.avg_impr_hour_dow)
+    end as hour_dow_ctr_28d,
+    null::numeric as post_type_ctr_14d,
+    h.label_engagement
+  from hist_norm h
+  left join recency r
+    on r.user_id = h.user_id and r.platform = h.platform
+   and r.dow = h.dow and r.hour = h.hour
+  on conflict (user_id, platform, timeslot)
+  do update set
+    dow = excluded.dow,
+    hour = excluded.hour,
+    seasonal_daily = excluded.seasonal_daily,
+    seasonal_weekly = excluded.seasonal_weekly,
+    recent_avg_engagement = excluded.recent_avg_engagement,
+    user_recent_avg_7d = excluded.user_recent_avg_7d,
+    hour_dow_ctr_28d = excluded.hour_dow_ctr_28d,
+    post_type_ctr_14d = excluded.post_type_ctr_14d,
+    label_engagement = excluded.label_engagement,
+    created_at = now_utc()
+  ;
+  get diagnostics ins_hist = row_count;
+
+  -- FUTURE (no labels)
+  with future_slots as (
+    select
+      p_user_id  as user_id,
+      p_platform as platform,
+      gs as timeslot,
+      extract(dow  from gs)::int  as dow,
+      extract(hour from gs)::int  as hour
+    from generate_series(date_trunc('hour', now()), date_trunc('hour', now() + make_interval(days => p_future_days)), interval '1 hour') as gs
+  ),
+  recency as (
+    select
+      p_user_id as user_id,
+      p_platform as platform,
+      extract(dow  from ts)::int as dow,
+      extract(hour from ts)::int as hour,
+      avg(case when metric = 'engagement' then value else null end) filter (where metric='engagement') as avg_engagement_hour_dow,
+      avg(case when metric = 'impressions' then value else null end) filter (where metric='impressions') as avg_impr_hour_dow
+    from public.v_analytics_events_all
+    where user_id = p_user_id
+      and platform = p_platform
+      and ts >= (now() - make_interval(days => p_history_days))
+      and ts <  now()
+    group by 1,2,3,4
+  )
+  insert into public.features_engagement_timeslots (
+    user_id, platform, timeslot, dow, hour,
+    is_holiday, post_type, audience_segment_id,
+    seasonal_daily, seasonal_weekly,
+    recent_avg_engagement, user_recent_avg_7d,
+    hour_dow_ctr_28d, post_type_ctr_14d,
+    label_engagement
+  )
+  select
+    f.user_id, f.platform, f.timeslot, f.dow, f.hour,
+    false as is_holiday,
+    null::post_type_enum as post_type,
+    null::int as audience_segment_id,
+    sin(2*pi()*f.hour/24.0)::float8 as seasonal_daily,
+    sin(2*pi()*f.dow/7.0)::float8  as seasonal_weekly,
+    r.avg_engagement_hour_dow as recent_avg_engagement,
+    r.avg_engagement_hour_dow as user_recent_avg_7d,
+    case when r.avg_impr_hour_dow is null or r.avg_impr_hour_dow = 0
+      then null
+      else (r.avg_engagement_hour_dow / r.avg_impr_hour_dow)
+    end as hour_dow_ctr_28d,
+    null::numeric as post_type_ctr_14d,
+    null::numeric as label_engagement
+  from future_slots f
+  left join recency r
+    on r.user_id = f.user_id and r.platform = f.platform
+   and r.dow = f.dow and r.hour = f.hour
+  on conflict (user_id, platform, timeslot)
+  do update set
+    dow = excluded.dow,
+    hour = excluded.hour,
+    seasonal_daily = excluded.seasonal_daily,
+    seasonal_weekly = excluded.seasonal_weekly,
+    recent_avg_engagement = excluded.recent_avg_engagement,
+    user_recent_avg_7d = excluded.user_recent_avg_7d,
+    hour_dow_ctr_28d = excluded.hour_dow_ctr_28d,
+    post_type_ctr_14d = excluded.post_type_ctr_14d,
+    created_at = now_utc()
+  ;
+  get diagnostics ins_future = row_count;
+
+  -- Refresh heatmap (requires UNIQUE index on mv)
+  refresh materialized view concurrently public.mv_user_hourly_perf;
+
+  return json_build_object(
+    'inserted_or_updated_historic', ins_hist,
+    'inserted_or_updated_future',  ins_future,
+    'history_days', p_history_days,
+    'future_days', p_future_days
+  );
+end $$;
+
+
+-- 1) Ensure the bucket exists and is public
+insert into storage.buckets (id, name, public)
+values ('media','media', true)
+on conflict (id) do nothing;
+
+-- 2) Public read for the media bucket
+drop policy if exists "Public read media" on storage.objects;
+create policy "Public read media"
+on storage.objects for select
+to public
+using (bucket_id = 'media');
+
+-- 3) Authenticated users can INSERT files into their own folder: {uid}/...
+drop policy if exists "Users can upload to their folder" on storage.objects;
+create policy "Users can upload to their folder"
+on storage.objects for insert
+to authenticated
+with check (
+  bucket_id = 'media'
+  and name like auth.uid()::text || '/%'   -- path starts with their UID/
+);
+
+-- 4) Authenticated users can UPDATE their own files
+drop policy if exists "Users can update their files" on storage.objects;
+create policy "Users can update their files"
+on storage.objects for update
+to authenticated
+using (
+  bucket_id = 'media'
+  and name like auth.uid()::text || '/%'
+)
+with check (
+  bucket_id = 'media'
+  and name like auth.uid()::text || '/%'
+);
+
+-- 5) Authenticated users can DELETE their own files
+drop policy if exists "Users can delete their files" on storage.objects;
+create policy "Users can delete their files"
+on storage.objects for delete
+to authenticated
+using (
+  bucket_id = 'media'
+  and name like auth.uid()::text || '/%'
+);
+
+
+-- =========================
+-- DONE
+-- =========================
+-- RPC: create_post_with_schedules
+-- Atomic post + schedules writer
+create or replace function public.create_post_with_schedules(
+  p_user_id uuid,
+  p_caption text,
+  p_post_type post_type_enum,
+  p_media_ids uuid[],                 -- ordered
+  p_platforms platform_enum[],        -- same length as p_target_ids
+  p_target_ids text[],                -- 1-1 with platforms
+  p_status post_status_enum,          -- 'draft' for calendar, or 'scheduled'
+  p_scheduled_at timestamptz          -- nullable for plain draft post
+) returns table(post_id uuid, scheduled_ids uuid[])
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_post_id uuid;
+  v_sched_ids uuid[] := '{}';
+  i int;
+begin
+  -- Enforce caller = owner
+  if p_user_id <> auth.uid() then
+    raise exception 'Forbidden';
+  end if;
+
+  -- 1) Create the post
+  insert into public.posts(user_id, caption, post_type)
+  values (p_user_id, p_caption, p_post_type)
+  returning id into v_post_id;
+
+  -- 2) Attach ordered media
+  if p_media_ids is not null then
+    insert into public.posts_media(post_id, media_id, position)
+    select v_post_id, mid, idx
+    from unnest(p_media_ids) with ordinality as t(mid, idx);
+  end if;
+
+  -- 3) Schedules (optional)
+  if p_platforms is not null and p_target_ids is not null then
+    if array_length(p_platforms,1) <> array_length(p_target_ids,1) then
+      raise exception 'platforms and target_ids length mismatch';
+    end if;
+
+    for i in 1..coalesce(array_length(p_platforms,1),0) loop
+      declare v_sched_id uuid;
+      begin
+        insert into public.scheduled_posts(
+          user_id, platform, target_id, post_id,
+          caption, post_type, status, scheduled_at
+        ) values (
+          p_user_id, p_platforms[i], p_target_ids[i], v_post_id,
+          p_caption, p_post_type, p_status, p_scheduled_at
+        ) returning id into v_sched_id;
+
+        -- link media to scheduled post (preserve order)
+        if p_media_ids is not null then
+          insert into public.scheduled_posts_media(scheduled_post_id, media_id, position)
+          select v_sched_id, mid, idx
+          from unnest(p_media_ids) with ordinality as t(mid, idx);
+        end if;
+
+        v_sched_ids := array_append(v_sched_ids, v_sched_id);
+      end;
+    end loop;
+  end if;
+
+  return query select v_post_id, v_sched_ids;
+end $$;
+
+alter table public.scheduled_posts
+  add column if not exists attempts int not null default 0;
+
+-- atomic failure handler: attempts+1, set status back to 'scheduled' so next tick can retry
+create or replace function public.sp_attempt_fail(p_id uuid, p_message text)
+returns void
+language sql
+security definer
+as $$
+  update public.scheduled_posts
+     set attempts = coalesce(attempts,0) + 1,
+         status = 'scheduled',
+         error_message = p_message,
+         updated_at = now()
+   where id = p_id;
+$$;
+
+create table if not exists public.user_devices (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  expo_push_token text,
+  created_at timestamptz default now()
+);
+create index if not exists idx_user_devices_user on public.user_devices(user_id);
+alter table public.user_devices enable row level security;
+
+do $$ begin
+  create policy devices_user_rw on public.user_devices
+    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;

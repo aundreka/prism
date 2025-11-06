@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "meta_publish_worker": {
+      "verify_jwt": false,
+      "schedule": "*/1 * * * *"
+    }
+  }
+}

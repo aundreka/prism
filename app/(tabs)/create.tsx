@@ -1,739 +1,773 @@
-import React, { useMemo, useState, useEffect } from "react";
-import {
-  View,
-  Text,
-  ScrollView,
-  TouchableOpacity,
-  StyleSheet,
-  TextInput,
-  Image,
-  Alert,
-  Platform,
-  Modal,
-} from "react-native";
-import * as ImagePicker from "expo-image-picker";
+// app/(tabs)/create.tsx
+import { supabase } from "@/lib/supabase";
+import { FontAwesome } from "@expo/vector-icons";
 import DateTimePicker from "@react-native-community/datetimepicker";
+import { Video } from "expo-av";
+import * as ExpoCrypto from "expo-crypto";
+import * as FileSystem from "expo-file-system/legacy";
+import * as ImageManipulator from "expo-image-manipulator";
+import * as ImagePicker from "expo-image-picker";
+import { router } from "expo-router";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  Image,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
 
-/* ---- Config ---- */
-const SPACING = 16;
-const RADIUS = 16;
+/* -------------------------
+   Config
+--------------------------*/
+const FUNC_BASE =
+  process.env.EXPO_PUBLIC_OAUTH_BASE ||
+  "https://lsaicrbtnbufgzxlyash.functions.supabase.co";
 
-const PLATFORM_COLORS = {
-  Instagram: "#E1306C",
-  Facebook: "#1877F2",
-  TikTok: "#111111",
-  "X (Twitter)": "#1DA1F2",
-  YouTube: "#FF0000",
+/* -------------------------
+   Theme helpers
+--------------------------*/
+const BG = "#F8FAFC";
+const TEXT = "#0F172A";
+const MUTED = "#64748B";
+const BORDER = "#E5E7EB";
+const TINT = "#111827";
+
+// header/footer spacers (safe padding so UI never sits under bars)
+const HEADER_SPACER = 72;  // room for header
+const FOOTER_SPACER = 120; // room for tab bar / action buttons
+
+function zeroPad(n: number) { return n < 10 ? `0${n}` : `${n}`; }
+function formatDateTime(d: Date) {
+  return `${d.getFullYear()}-${zeroPad(d.getMonth()+1)}-${zeroPad(d.getDate())} ${zeroPad(d.getHours())}:${zeroPad(d.getMinutes())}`;
+}
+function initials(name?: string | null) {
+  if (!name) return "U";
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 1) return parts[0][0]?.toUpperCase() || "U";
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+function fileExtFromUri(uri: string) {
+  const q = uri.split("?")[0];
+  const m = q.match(/\.(\w+)(?:$|#)/);
+  return m ? m[1].toLowerCase() : "jpg";
+}
+
+/* -------------------------
+   Base64 → Uint8Array
+--------------------------*/
+function base64ToUint8Array(b64: string) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const lookup = new Uint8Array(256);
+  for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+
+  let bufferLength = b64.length * 0.75;
+  if (b64.endsWith("==")) bufferLength -= 2;
+  else if (b64.endsWith("=")) bufferLength -= 1;
+
+  const bytes = new Uint8Array(bufferLength);
+  let p = 0;
+
+  for (let i = 0; i < b64.length; i += 4) {
+    const enc1 = lookup[b64.charCodeAt(i)];
+    const enc2 = lookup[b64.charCodeAt(i + 1)];
+    const enc3 = lookup[b64.charCodeAt(i + 2)];
+    const enc4 = lookup[b64.charCodeAt(i + 3)];
+    const n = (enc1 << 18) | (enc2 << 12) | ((enc3 & 63) << 6) | (enc4 & 63);
+    if (p < bufferLength) bytes[p++] = (n >> 16) & 255;
+    if (p < bufferLength) bytes[p++] = (n >> 8) & 255;
+    if (p < bufferLength) bytes[p++] = n & 255;
+  }
+  return bytes;
+}
+
+/* -------------------------
+   Upload to Supabase Storage (bucket: media)
+--------------------------*/
+async function uploadToBucket(uid: string, localUri: string, mimeType?: string | null) {
+  const ext = fileExtFromUri(localUri);
+  const fileName = `${await ExpoCrypto.randomUUID()}.${ext}`;
+  const path = `${uid}/${fileName}`;
+  const base64 = await FileSystem.readAsStringAsync(localUri, { encoding: "base64" as any });
+  const binary = base64ToUint8Array(base64);
+  const { error } = await supabase.storage.from("media").upload(path, binary, {
+    contentType: mimeType || undefined,
+    upsert: false,
+  });
+  if (error) throw error;
+  const { data: pub } = supabase.storage.from("media").getPublicUrl(path);
+  return { path, publicUrl: pub?.publicUrl || null };
+}
+
+/* -------------------------
+   Types (schema mirror)
+--------------------------*/
+type PlatformEnum = "facebook" | "instagram";
+type PostTypeEnum = "image" | "video" | "reel" | "story" | "carousel" | "link";
+type PostStatusEnum = "draft" | "scheduled" | "posting" | "posted" | "failed" | "canceled";
+
+type ConnectedMeta = {
+  id: string;
+  user_id: string;
+  platform: PlatformEnum;
+  page_id: string | null;
+  page_name: string | null;
+  ig_user_id: string | null;
+  ig_username: string | null;
+  access_token: string;
+  token_expires_at: string | null;
 };
-const ALL_PLATFORMS = Object.keys(PLATFORM_COLORS);
 
-const TEMPLATES = [
-  {
-    id: "t1",
-    name: "Product Spotlight",
-    caption:
-      "Meet our newest drop 🔥 Quick specs, price, and why it’s a game-changer. #NewRelease",
-    note: "Best for square (1:1) or 4:5 portrait.",
-  },
-  {
-    id: "t2",
-    name: "How-To / Tutorial",
-    caption:
-      "3-step guide to better lighting 💡 Save for later! #Tips #BehindTheScenes",
-    note: "Great for 9:16 (TikTok/Reels/Shorts).",
-  },
-  {
-    id: "t3",
-    name: "Announcement",
-    caption:
-      "We’re going live this weekend! Drop your questions below 👇 #LiveStream",
-    note: "Works across platforms; add a thumbnail.",
-  },
-];
-
+/* -------------------------
+   Main Screen
+--------------------------*/
 export default function CreateScreen() {
-  /* Selection state */
-  const [selectedPlatforms, setSelectedPlatforms] = useState(new Set(["Instagram"]));
-  const [selectedTemplate, setSelectedTemplate] = useState(null);
+  const [uid, setUid] = useState<string | null>(null);
+  const [connections, setConnections] = useState<ConnectedMeta[]>([]);
+  const [loadingConn, setLoadingConn] = useState(true);
+
   const [caption, setCaption] = useState("");
-  const [mediaUri, setMediaUri] = useState(null);
-  const [mediaRatio, setMediaRatio] = useState(1); // width/height
+  const [mediaLocal, setMediaLocal] = useState<Array<{
+    uri: string; type: "image" | "video"; width?: number; height?: number; durationMs?: number; mimeType?: string;
+  }>>([]);
+  const [croppingIndex, setCroppingIndex] = useState<number | null>(null);
 
-  /* Scheduler state */
-  const [scheduleOpen, setScheduleOpen] = useState(false);
-  const [customDate, setCustomDate] = useState(new Date());
-  const [customTime, setCustomTime] = useState(new Date());
-  const [useCustom, setUseCustom] = useState(false);
-  const [scheduledAt, setScheduledAt] = useState(null); // Date | null
+  const [platformFB, setPlatformFB] = useState(false);
+  const [platformIG, setPlatformIG] = useState(false);
 
-  /* Permissions (iOS needs explicit) */
+  const [dateTimes, setDateTimes] = useState<Date[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+
+  // Scheduler modal state
+  const [pickerVisible, setPickerVisible] = useState(false);
+  const [pickerIndex, setPickerIndex] = useState<number | null>(null);
+  const [tempDate, setTempDate] = useState<Date>(new Date());
+  const [step, setStep] = useState<"date" | "time">("date"); // Android: two-step
+
+  // Fetch user + connections
   useEffect(() => {
     (async () => {
-      if (Platform.OS !== "web") {
-        const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-        if (status !== "granted") {
-          Alert.alert("Permission needed", "Please allow photo library access to upload media.");
-        }
+      try {
+        const { data } = await supabase.auth.getUser();
+        const user = data?.user;
+        if (!user) { Alert.alert("Sign in required", "Please log in to create posts."); router.replace("/(auth)"); return; }
+        setUid(user.id);
+        setLoadingConn(true);
+        const { data: conn, error } = await supabase
+          .from("connected_meta_accounts")
+          .select("id,user_id,platform,page_id,page_name,ig_user_id,ig_username,access_token,token_expires_at")
+          .eq("user_id", user.id)
+          .order("created_at", { ascending: false });
+        if (error) throw error;
+        setConnections((conn || []) as any);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoadingConn(false);
       }
     })();
   }, []);
 
-  const togglePlatform = (p) => {
-    const s = new Set(selectedPlatforms);
-    if (s.has(p)) s.delete(p);
-    else s.add(p);
-    setSelectedPlatforms(s);
-  };
+  const connectedFB = useMemo(() => connections.find((c) => c.platform === "facebook" && c.page_id), [connections]);
+  const connectedIG = useMemo(() => connections.find((c) => c.platform === "instagram" && c.ig_user_id), [connections]);
 
-  const applyTemplate = (tpl) => {
-    setSelectedTemplate(tpl.id);
-    setCaption((prev) => (prev.trim() ? `${prev}\n\n${tpl.caption}` : tpl.caption));
-  };
+  const canCreateAtAll = !!(connectedFB || connectedIG);
+  const submitPlatforms: PlatformEnum[] = useMemo(() => {
+    const arr: PlatformEnum[] = [];
+    if (platformFB && connectedFB) arr.push("facebook");
+    if (platformIG && connectedIG) arr.push("instagram");
+    return arr;
+  }, [platformFB, connectedFB, platformIG, connectedIG]);
 
-  const pickMedia = async () => {
-    try {
-      const res = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.All,
-        quality: 0.9,
-        allowsEditing: true,
-      });
-      if (!res.canceled && res.assets?.length) {
-        const asset = res.assets[0];
-        setMediaUri(asset.uri);
-        if (asset.width && asset.height) setMediaRatio(asset.width / asset.height);
-      }
-    } catch (e) {
-      Alert.alert("Picker error", String(e?.message || e));
-    }
-  };
+  const selectedTargets: string[] = useMemo(() => {
+    const t: string[] = [];
+    if (platformFB && connectedFB?.page_id) t.push(connectedFB.page_id);
+    if (platformIG && connectedIG?.ig_user_id) t.push(connectedIG.ig_user_id);
+    return t;
+  }, [platformFB, connectedFB, platformIG, connectedIG]);
 
-  const clearMedia = () => {
-    setMediaUri(null);
-    setMediaRatio(1);
-  };
-
-  const canPreview = selectedPlatforms.size > 0 && caption.trim() && mediaUri;
-
-  /* Preview cards derived from platform */
-  const previews = useMemo(() => {
-    if (!canPreview) return [];
-    return [...selectedPlatforms].map((p) => ({
-      platform: p,
-      color: PLATFORM_COLORS[p],
-      boxStyle: getPreviewBoxStyleForPlatform(p),
+  /* -------------------------
+     Media Picker
+  --------------------------*/
+  const pickMedia = useCallback(async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== "granted") { Alert.alert("Permission needed", "Please allow gallery access."); return; }
+    const res = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.All,
+      allowsMultipleSelection: true,
+      selectionLimit: 10,
+      quality: 1,
+    });
+    if (res.canceled) return;
+    const mapped = res.assets.map((a) => ({
+      uri: a.uri,
+      type: a.type?.includes("video") ? "video" : "image",
+      width: a.width,
+      height: a.height,
+      durationMs: a.duration ? Math.round(a.duration * 1000) : undefined,
+      mimeType: a.mimeType || (a.type?.includes("video") ? "video/mp4" : "image/jpeg"),
     }));
-  }, [selectedPlatforms, caption, mediaUri, canPreview]);
+    setMediaLocal((prev) => [...prev, ...mapped]);
+  }, []);
 
-  /* ---- Schedule helpers ---- */
-  const openScheduler = () => {
-    if (!canPreview) {
-      Alert.alert("Missing info", "Pick platform(s), upload media, and write a caption first.");
-      return;
-    }
-    setScheduledAt(null);
-    setUseCustom(false);
-    const now = new Date();
-    setCustomDate(now);
-    setCustomTime(now);
-    setScheduleOpen(true);
+  /* -------------------------
+     Crop presets (images)
+  --------------------------*/
+  const doCropPreset = useCallback(
+    async (ratio: "1:1" | "4:5" | "16:9") => {
+      if (croppingIndex == null) return;
+      const asset = mediaLocal[croppingIndex];
+      if (!asset || asset.type !== "image" || !asset.width || !asset.height) return;
+
+      const [rw, rh] = ratio === "1:1" ? [1,1] : ratio === "4:5" ? [4,5] : [16,9];
+      const targetRatio = rw / rh;
+
+      const srcW = asset.width; const srcH = asset.height; const srcRatio = srcW / srcH;
+      let cropW = 0, cropH = 0;
+      if (srcRatio > targetRatio) { cropH = srcH; cropW = Math.round(cropH * targetRatio); }
+      else { cropW = srcW; cropH = Math.round(cropW / targetRatio); }
+      const originX = Math.round((srcW - cropW) / 2);
+      const originY = Math.round((srcH - cropH) / 2);
+
+      const result = await ImageManipulator.manipulateAsync(
+        asset.uri,
+        [{ crop: { originX, originY, width: cropW, height: cropH } }],
+        { compress: 1, format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      const updated = [...mediaLocal];
+      updated[croppingIndex] = { ...asset, uri: result.uri, width: cropW, height: cropH, mimeType: "image/jpeg" };
+      setMediaLocal(updated);
+    },
+    [croppingIndex, mediaLocal]
+  );
+
+  const removeMedia = useCallback((idx: number) => {
+    setMediaLocal((prev) => prev.filter((_, i) => i !== idx));
+    if (croppingIndex === idx) setCroppingIndex(null);
+  }, [croppingIndex]);
+
+  /* -------------------------
+     Scheduler helpers
+  --------------------------*/
+  const openPicker = (index: number) => {
+    const base = dateTimes[index] ?? new Date(Date.now() + 60 * 60 * 1000);
+    setTempDate(base);
+    setPickerIndex(index);
+    if (Platform.OS === "android") setStep("date");
+    setPickerVisible(true);
   };
-
-  const closeScheduler = () => setScheduleOpen(false);
-
-  const quickSet = (date) => {
-    setScheduledAt(date);
-    setUseCustom(false);
+  const addSchedule = () => {
+    const dt = new Date(Date.now() + 60 * 60 * 1000);
+    setDateTimes((prev) => [...prev, dt]);
+    openPicker(dateTimes.length);
   };
+  const confirmPickerIOS = () => {
+    if (pickerIndex == null) return;
+    const copy = [...dateTimes];
+    copy[pickerIndex] = tempDate;
+    setDateTimes(copy);
+    setPickerVisible(false);
+  };
+  const onChangeAndroid = (_: any, d?: Date) => {
+    if (!d) { setPickerVisible(false); return; }
+    if (step === "date") {
+      const next = new Date(tempDate);
+      next.setFullYear(d.getFullYear(), d.getMonth(), d.getDate());
+      setTempDate(next);
+      setStep("time");
+    } else {
+      const next = new Date(tempDate);
+      next.setHours(d.getHours(), d.getMinutes(), 0, 0);
+      if (pickerIndex != null) {
+        const copy = [...dateTimes];
+        copy[pickerIndex] = next;
+        setDateTimes(copy);
+      }
+      setPickerVisible(false);
+      setStep("date");
+    }
+  };
+  const removeSchedule = (i: number) => setDateTimes((prev) => prev.filter((_, idx) => idx !== i));
 
-  const confirmSchedule = () => {
-    let when = scheduledAt;
-    if (!when && useCustom) {
-      when = combineDateAndTime(customDate, customTime);
+  /* -------------------------
+     Submit
+  --------------------------*/
+  async function submit(status: PostStatusEnum) {
+    try {
+      if (!uid) return;
+      if (!canCreateAtAll) { Alert.alert("Connect required", "Connect Facebook or Instagram first."); return; }
+      if (submitPlatforms.length === 0) { Alert.alert("Pick a platform", "Choose Facebook, Instagram, or both."); return; }
+      if (mediaLocal.length === 0) { Alert.alert("Add media", "Please select at least one image or video."); return; }
+
+      setSubmitting(true);
+
+      // Upload media
+      const mediaIds: string[] = [];
+      for (const m of mediaLocal) {
+        const { path, publicUrl } = await uploadToBucket(uid, m.uri, m.mimeType);
+        const { data, error } = await supabase
+          .from("media_assets")
+          .insert({
+            user_id: uid,
+            storage_path: path,
+            public_url: publicUrl,
+            width: m.width ?? null,
+            height: m.height ?? null,
+            duration_ms: m.durationMs ?? null,
+            mime_type: m.mimeType ?? null,
+          })
+          .select("id")
+          .single();
+        if (error) throw error;
+        mediaIds.push(data.id);
+      }
+
+      // Determine post type
+      const hasVideo = mediaLocal.some((m) => m.type === "video");
+      const postType: PostTypeEnum = hasVideo
+        ? mediaLocal.length > 1 ? "carousel" : "video"
+        : mediaLocal.length > 1 ? "carousel" : "image";
+
+      // Schedule list: draft -> single null; scheduled -> one or many
+      const scheduleList = status === "draft" ? [null] : (dateTimes.length ? dateTimes : [new Date()]);
+
+      for (const when of scheduleList) {
+        const { error } = await supabase.rpc("create_post_with_schedules", {
+          p_user_id: uid,
+          p_caption: caption,
+          p_post_type: postType,
+          p_media_ids: mediaIds,
+          p_platforms: submitPlatforms,
+          p_target_ids: selectedTargets,
+          p_status: status,
+          p_scheduled_at: when,
+        });
+        if (error) throw error;
+      }
+
+      // 🔔 Trigger the worker immediately whenever a post is SCHEDULED
+      if (status === "scheduled" && FUNC_BASE) {
+        // fire-and-forget
+        fetch(`${FUNC_BASE}/meta_publish_worker`, { method: "POST" }).catch(() => {});
+      }
+
+      Alert.alert(
+        "Success",
+        status === "draft"
+          ? "Saved to drafts."
+          : dateTimes.length > 1
+          ? `Scheduled ${dateTimes.length} times.`
+          : "Scheduled."
+      );
+      router.push("/(tabs)/calendar");
+    } catch (e: any) {
+      console.error(e);
+      Alert.alert("Error", e?.message ?? "Failed to create post.");
+    } finally {
+      setSubmitting(false);
     }
-    if (!when) {
-      Alert.alert("Pick a time", "Choose a quick option or set a custom date & time.");
-      return;
-    }
-    if (when < new Date()) {
-      Alert.alert("Invalid time", "Schedule must be in the future.");
-      return;
-    }
-    setScheduleOpen(false);
-    Alert.alert(
-      "Scheduled (mock)",
-      `Will schedule for ${when.toLocaleString()} on ${[...selectedPlatforms].join(", ")}`
+  }
+
+  /* -------------------------
+     Previews
+  --------------------------*/
+  function IGPreview() {
+    const h = connectedIG?.ig_username ? `@${connectedIG.ig_username}` : "@instagram_user";
+    return (
+      <View style={styles.previewCard}>
+        <View style={styles.previewHeader}>
+          <View style={styles.avatarSm}><Text style={styles.avatarSmText}>{initials(connectedIG?.ig_username || "IG")}</Text></View>
+          <Text style={styles.previewTitle} numberOfLines={1}>{h}</Text>
+          <FontAwesome name="ellipsis-h" size={16} color={MUTED} style={{ marginLeft: "auto" }} />
+        </View>
+        {mediaLocal[0]?.type === "image" ? (
+          <Image source={{ uri: mediaLocal[0].uri }} style={styles.previewMedia} />
+        ) : (
+          <View style={styles.previewMedia}>
+            <Video source={{ uri: mediaLocal[0].uri }} style={{ width:"100%", height:"100%" }} useNativeControls={false} isMuted shouldPlay={false} resizeMode="cover" />
+            <View style={styles.videoOverlay}><FontAwesome name="play" size={28} color="#fff" /></View>
+          </View>
+        )}
+        {caption ? <Text style={styles.previewCaption}>{caption}</Text> : null}
+      </View>
     );
-  };
+  }
+  function FBPreview() {
+    const name = connectedFB?.page_name || "Facebook Page";
+    return (
+      <View style={styles.previewCard}>
+        <View style={styles.previewHeader}>
+          <View style={[styles.avatarSm, { backgroundColor: "#1877F2" }]}><Text style={styles.avatarSmText}>{initials(name)}</Text></View>
+          <Text style={styles.previewTitle} numberOfLines={1}>{name}</Text>
+          <FontAwesome name="ellipsis-h" size={16} color={MUTED} style={{ marginLeft: "auto" }} />
+        </View>
+        {mediaLocal[0]?.type === "image" ? (
+          <Image source={{ uri: mediaLocal[0].uri }} style={styles.previewMedia} />
+        ) : (
+          <View style={styles.previewMedia}>
+            <Video source={{ uri: mediaLocal[0].uri }} style={{ width:"100%", height:"100%" }} useNativeControls={false} isMuted shouldPlay={false} resizeMode="cover" />
+            <View style={styles.videoOverlay}><FontAwesome name="play" size={28} color="#fff" /></View>
+          </View>
+        )}
+        {caption ? <Text style={styles.previewCaption}>{caption}</Text> : null}
+      </View>
+    );
+  }
 
-  /* Quick options */
-  const tonight6pm = () => atTodayOrTomorrow(18, 0);
-  const tomorrow10am = () => addDaysAtTime(new Date(), 1, 10, 0);
-  const nextMon9am = () => nextWeekdayAtTime(1, 9, 0); // Monday = 1 (Mon)
-  const in30min = () => {
-    const d = new Date();
-    d.setMinutes(d.getMinutes() + 30);
-    return d;
-  };
+  const previewTabs = useMemo(() => {
+    const tabs: Array<{ key: PlatformEnum; label: string; shown: boolean }> = [
+      { key: "instagram", label: "Instagram", shown: platformIG },
+      { key: "facebook", label: "Facebook", shown: platformFB },
+    ];
+    const has = tabs.filter((t) => t.shown);
+    return has.length ? has : [{ key: "instagram", label: "Instagram", shown: true }];
+  }, [platformIG, platformFB]);
+
+  /* -------------------------
+     Render
+  --------------------------*/
+  if (loadingConn) {
+    return (
+      <View style={[styles.container, { alignItems:"center", justifyContent:"center" }]}>
+        <ActivityIndicator />
+        <Text style={{ marginTop: 8, color: MUTED }}>Loading…</Text>
+      </View>
+    );
+  }
 
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={{ paddingTop: 110, paddingBottom: 90, gap: SPACING }}
-      showsVerticalScrollIndicator={false}
-    >
-      {/* Title */}
-      <View style={styles.headerBlock}>
-        <Text style={styles.title}>Create</Text>
-        <Text style={styles.subtitle}>Pick a template, choose platforms, add media, and preview.</Text>
-      </View>
-
-      {/* Templates */}
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Templates</Text>
-        <Text style={styles.sectionHint}>Tap to apply</Text>
-      </View>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={{ paddingHorizontal: SPACING, gap: 12 }}
-      >
-        {TEMPLATES.map((t) => (
-          <TouchableOpacity
-            key={t.id}
-            activeOpacity={0.9}
-            onPress={() => applyTemplate(t)}
-            style={[
-              styles.card,
-              styles.templateCard,
-              selectedTemplate === t.id && styles.cardSelected,
-            ]}
-          >
-            <Text style={styles.templateName}>{t.name}</Text>
-            <Text style={styles.templateCaption} numberOfLines={2}>
-              {t.caption}
-            </Text>
-            <Text style={styles.templateNote}>{t.note}</Text>
-          </TouchableOpacity>
-        ))}
-      </ScrollView>
-
-      {/* Platforms */}
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Platforms</Text>
-        <Text style={styles.sectionHint}>Choose one or more</Text>
-      </View>
-      <View style={[styles.card, { paddingVertical: 10 }]}>
-        <View style={styles.platformRow}>
-          {ALL_PLATFORMS.map((p) => {
-            const active = selectedPlatforms.has(p);
-            return (
-              <TouchableOpacity
-                key={p}
-                onPress={() => togglePlatform(p)}
-                activeOpacity={0.9}
-                style={[
-                  styles.chip,
-                  { borderColor: PLATFORM_COLORS[p] },
-                  active && { backgroundColor: "#DBEAFE", borderColor: "#93C5FD" },
-                ]}
-              >
-                <Text style={[styles.chipText, active && { color: "#1E3A8A", fontWeight: "700" }]}>
-                  {p}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+    <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <ScrollView contentContainerStyle={styles.content}>
+        {/* Top bar: title + connect warning */}
+        <View style={styles.topBar}>
+          <Text style={styles.title}>Create</Text>
+          {!canCreateAtAll && (
+            <View style={styles.warnPill}>
+              <FontAwesome name="plug" size={12} color="#991B1B" />
+              <Text style={styles.warnText}>Connect Meta</Text>
+            </View>
+          )}
         </View>
-      </View>
 
-      {/* Media uploader */}
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Upload Content</Text>
-        <Text style={styles.sectionHint}>Images or videos from your library</Text>
-      </View>
-      <View style={styles.card}>
-        {mediaUri ? (
-          <>
-            <View style={styles.mediaHeader}>
-              <Text style={styles.mediaMeta}>
-                Selected • Ratio {mediaRatio.toFixed(2)}:1
-              </Text>
-              <View style={{ flexDirection: "row", gap: 8 }}>
-                <TouchableOpacity onPress={pickMedia} style={styles.ghostBtn} activeOpacity={0.9}>
-                  <Text style={styles.ghostBtnText}>Replace</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={clearMedia} style={styles.ghostDanger} activeOpacity={0.9}>
-                  <Text style={styles.ghostDangerText}>Remove</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            <View style={styles.selectedMediaBox}>
-              <Image
-                source={{ uri: mediaUri }}
-                style={{ width: "100%", height: "100%", borderRadius: 12 }}
-                resizeMode="cover"
-              />
-            </View>
-          </>
-        ) : (
-          <TouchableOpacity onPress={pickMedia} activeOpacity={0.95} style={styles.uploadBtn}>
-            <Text style={styles.uploadBtnText}>+ Pick from Library</Text>
-            <Text style={styles.uploadSub}>Allows crop/edit • High quality</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      {/* Caption */}
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Caption</Text>
-        <Text style={styles.sectionHint}>Write your copy</Text>
-      </View>
-      <View style={styles.card}>
-        <TextInput
-          value={caption}
-          onChangeText={setCaption}
-          placeholder="Write a caption…"
-          placeholderTextColor="#94A3B8"
-          multiline
-          style={styles.input}
-        />
-        <View style={styles.captionActions}>
-          <TouchableOpacity
-            onPress={() => setCaption("")}
-            style={styles.ghostBtn}
-            activeOpacity={0.9}
-          >
-            <Text style={styles.ghostBtnText}>Clear</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() =>
-              setCaption((c) =>
-                `${c}${c && !c.endsWith("\n") ? "\n" : ""}\n#hashtag #another`
-              )
-            }
-            style={styles.ghostBtn}
-            activeOpacity={0.9}
-          >
-            <Text style={styles.ghostBtnText}>Add Hashtags</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Preview */}
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Preview</Text>
-        <Text style={styles.sectionHint}>
-          {canPreview ? "Per-platform framing" : "Pick platform(s), media, and caption"}
-        </Text>
-      </View>
-
-      {canPreview ? (
-        <View style={{ gap: 12 }}>
-          {previews.map((pv) => (
-            <View key={pv.platform} style={styles.card}>
-              <View style={styles.rowBetween}>
-                <View style={styles.row}>
-                  <View style={[styles.platformDot, { backgroundColor: pv.color }]} />
-                  <Text style={styles.previewPlatform}>{pv.platform}</Text>
-                </View>
-                <Text style={styles.previewBadge}>Preview</Text>
-              </View>
-
-              <View style={[styles.mediaFrame, pv.boxStyle]}>
-                <Image source={{ uri: mediaUri }} style={styles.mediaFramedImage} resizeMode="cover" />
-              </View>
-
-              <Text style={styles.previewCaption}>{caption}</Text>
-            </View>
-          ))}
-        </View>
-      ) : (
-        <View style={[styles.card, styles.centerCard]}>
-          <Text style={styles.emptyText}>
-            Choose platform(s), upload media, and add a caption to preview.
-          </Text>
-        </View>
-      )}
-
-      {/* Actions */}
-      <View style={styles.actionsRow}>
-        <TouchableOpacity
-          onPress={() => {
-            if (!canPreview) return Alert.alert("Missing info", "Complete your post details first.");
-            Alert.alert("Mock Publish", `Would publish to: ${[...selectedPlatforms].join(", ")}`);
-          }}
-          activeOpacity={0.95}
-          style={styles.primaryBtn}
-        >
-          <Text style={styles.primaryBtnText}>Publish</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={openScheduler}
-          activeOpacity={0.95}
-          style={styles.secondaryBtn}
-        >
-          <Text style={styles.secondaryBtnText}>
-            {scheduledAt ? `Scheduled • ${scheduledAt.toLocaleString()}` : "Schedule"}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Schedule Modal */}
-      <Modal animationType="slide" transparent visible={scheduleOpen} onRequestClose={closeScheduler}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.modalTitle}>Schedule Post</Text>
-              <TouchableOpacity onPress={closeScheduler} style={styles.modalClose}>
-                <Text style={styles.modalCloseText}>✕</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={styles.modalHint}>Quick options</Text>
-            <View style={styles.quickRow}>
-              <QuickChip label="Tonight 6PM" onPress={() => quickSet(tonight6pm())} />
-              <QuickChip label="Tomorrow 10AM" onPress={() => quickSet(tomorrow10am())} />
-            </View>
-            <View style={styles.quickRow}>
-              <QuickChip label="Next Mon 9AM" onPress={() => quickSet(nextMon9am())} />
-              <QuickChip label="In 30 min" onPress={() => quickSet(in30min())} />
-            </View>
-
-            <View style={styles.divider} />
-
+        {/* Platform chips */}
+        <View style={styles.section}>
+          <Text style={styles.sectionLabel}>Platforms</Text>
+          <View style={styles.chipsRow}>
             <TouchableOpacity
-              onPress={() => {
-                setUseCustom(true);
-                setScheduledAt(null);
-              }}
-              style={[styles.ghostBtn, { alignSelf: "flex-start" }]}
+              disabled={!connectedIG}
+              onPress={() => setPlatformIG((v) => !v)}
+              style={[styles.chipBig, platformIG && styles.chipBigActive, !connectedIG && styles.chipDisabled]}
             >
-              <Text style={styles.ghostBtnText}>{useCustom ? "Custom (editing)" : "Pick Custom"}</Text>
+              <FontAwesome name="instagram" size={16} color={platformIG ? "#fff" : connectedIG ? "#C13584" : "#9CA3AF"} />
+              <Text style={[styles.chipBigText, platformIG && styles.chipBigTextActive]}>IG</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={!connectedFB}
+              onPress={() => setPlatformFB((v) => !v)}
+              style={[styles.chipBig, platformFB && styles.chipBigActive, !connectedFB && styles.chipDisabled]}
+            >
+              <FontAwesome name="facebook-square" size={16} color={platformFB ? "#fff" : connectedFB ? "#1877F2" : "#9CA3AF"} />
+              <Text style={[styles.chipBigText, platformFB && styles.chipBigTextActive]}>FB</Text>
             </TouchableOpacity>
 
-            {useCustom && (
-              <View style={{ gap: 10, marginTop: 8 }}>
-                <Text style={styles.modalHint}>Select date</Text>
-                <DateTimePicker
-                  value={customDate}
-                  mode="date"
-                  display={Platform.OS === "ios" ? "spinner" : "default"}
-                  onChange={(_, d) => d && setCustomDate(d)}
-                  style={{ alignSelf: "stretch" }}
-                />
-                <Text style={styles.modalHint}>Select time</Text>
-                <DateTimePicker
-                  value={customTime}
-                  mode="time"
-                  display={Platform.OS === "ios" ? "spinner" : "default"}
-                  onChange={(_, d) => d && setCustomTime(d)}
-                  style={{ alignSelf: "stretch" }}
-                />
-              </View>
-            )}
-
-            {!!scheduledAt && !useCustom && (
-              <View style={styles.selectedRow}>
-                <Text style={styles.selectedText}>
-                  Selected: {scheduledAt.toLocaleString()}
-                </Text>
-                <TouchableOpacity onPress={() => setScheduledAt(null)}>
-                  <Text style={[styles.ghostDangerText, { fontWeight: "800" }]}>Clear</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            <View style={styles.modalActions}>
-              <TouchableOpacity onPress={closeScheduler} style={styles.modalSecondary}>
-                <Text style={styles.secondaryBtnText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={confirmSchedule} style={styles.modalPrimary}>
-                <Text style={styles.primaryBtnText}>Confirm</Text>
-              </TouchableOpacity>
-            </View>
+            <TouchableOpacity onPress={pickMedia} style={[styles.iconBtnLite]}>
+              <FontAwesome name="image" size={16} color={TINT} />
+              <Text style={styles.iconBtnLiteText}>Add</Text>
+            </TouchableOpacity>
           </View>
         </View>
+
+        {/* Media scroller */}
+        <View style={styles.section}>
+          {mediaLocal.length === 0 ? (
+            <View style={styles.emptyBox}>
+              <FontAwesome name="image" size={28} color={MUTED} />
+              <Text style={{ color: MUTED, marginTop: 6 }}>Pick photos or videos</Text>
+            </View>
+          ) : (
+            <FlatList
+              data={mediaLocal}
+              keyExtractor={(_, i) => String(i)}
+              horizontal
+              ItemSeparatorComponent={() => <View style={{ width: 10 }} />}
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingVertical: 2 }}
+              renderItem={({ item, index }) => (
+                <TouchableOpacity
+                  onPress={() => { if (item.type === "image") setCroppingIndex(index); }}
+                  activeOpacity={0.9}
+                  style={styles.mediaThumbWrap}
+                >
+                  {item.type === "image" ? (
+                    <Image source={{ uri: item.uri }} style={styles.mediaThumb} />
+                  ) : (
+                    <View style={styles.mediaThumb}>
+                      <Video source={{ uri: item.uri }} style={{ width:"100%", height:"100%", borderRadius: 12 }} resizeMode="cover" isMuted shouldPlay={false} />
+                      <View style={styles.playBadge}><FontAwesome name="play" color="#fff" size={12} /></View>
+                    </View>
+                  )}
+                  <TouchableOpacity style={styles.removeBadge} onPress={() => removeMedia(index)} hitSlop={{ top:10, right:10, bottom:10, left:10 }}>
+                    <FontAwesome name="times" color="#fff" size={12} />
+                  </TouchableOpacity>
+                </TouchableOpacity>
+              )}
+            />
+          )}
+
+          {/* Crop presets row */}
+          {croppingIndex != null && mediaLocal[croppingIndex]?.type === "image" ? (
+            <View style={styles.cropRow}>
+              <Text style={styles.subtle}>Crop</Text>
+              <TouchableOpacity onPress={() => doCropPreset("1:1")} style={styles.chipSmall}><Text style={styles.chipSmallText}>1:1</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => doCropPreset("4:5")} style={styles.chipSmall}><Text style={styles.chipSmallText}>4:5</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => doCropPreset("16:9")} style={styles.chipSmall}><Text style={styles.chipSmallText}>16:9</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => setCroppingIndex(null)} style={[styles.chipSmall, { backgroundColor:"#F3F4F6", borderColor:BORDER }]}><Text style={[styles.chipSmallText, { color: TEXT }]}>Done</Text></TouchableOpacity>
+            </View>
+          ) : null}
+        </View>
+
+        {/* Caption */}
+        <View style={styles.section}>
+          <Text style={styles.sectionLabel}>Caption</Text>
+          <View style={styles.captionBox}>
+            <TextInput
+              value={caption}
+              onChangeText={setCaption}
+              multiline
+              placeholder="Write a caption…"
+              placeholderTextColor="#94A3B8"
+              style={styles.captionInput}
+              maxLength={2200}
+            />
+            <Text style={styles.counter}>{caption.length}/2200</Text>
+          </View>
+        </View>
+
+        {/* Live Preview */}
+        {mediaLocal.length > 0 ? (
+          <View style={styles.section}>
+            <View style={styles.previewTabs}>
+              {previewTabs.map((t) => (
+                <View key={t.key} style={styles.tabPill}><Text style={styles.tabText}>{t.label}</Text></View>
+              ))}
+            </View>
+            {platformIG ? <IGPreview /> : platformFB ? <FBPreview /> : <IGPreview />}
+          </View>
+        ) : null}
+
+        {/* Scheduler */}
+        <View style={styles.section}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.sectionLabel}>Schedule</Text>
+            <TouchableOpacity onPress={addSchedule} style={styles.iconBtnLite}>
+              <FontAwesome name="plus" size={14} color={TINT} />
+              <Text style={styles.iconBtnLiteText}>Add</Text>
+            </TouchableOpacity>
+          </View>
+
+          {dateTimes.length === 0 ? (
+            <Text style={{ color: MUTED, marginTop: 6 }}>No schedules yet.</Text>
+          ) : (
+            <View style={styles.timeChipWrap}>
+              {dateTimes.map((dt, i) => (
+                <View key={i} style={styles.timeChip}>
+                  <TouchableOpacity onPress={() => openPicker(i)} style={styles.timeChipInner} activeOpacity={0.9}>
+                    <FontAwesome name="clock-o" size={12} color="#fff" />
+                    <Text style={styles.timeChipText}>{formatDateTime(dt)}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => removeSchedule(i)} style={styles.timeChipX} hitSlop={{ top:8, bottom:8, left:8, right:8 }}>
+                    <FontAwesome name="times" size={10} color="#fff" />
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+
+        {/* Actions */}
+        <View style={styles.actionRow}>
+          <TouchableOpacity
+            onPress={() => submit("draft")}
+            disabled={!canCreateAtAll || submitting}
+            style={[styles.actionBtn, styles.btnGhost, (!canCreateAtAll || submitting) && styles.disabled]}
+          >
+            <FontAwesome name="save" size={14} color={TINT} />
+            <Text style={styles.actionGhostText}>Draft</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => submit("scheduled")}
+            disabled={!canCreateAtAll || submitPlatforms.length === 0 || mediaLocal.length === 0 || submitting}
+            style={[styles.actionBtn, styles.btnPrimary, (!canCreateAtAll || submitPlatforms.length === 0 || mediaLocal.length === 0 || submitting) && styles.disabled]}
+          >
+            {submitting ? <ActivityIndicator color="#fff" /> : <FontAwesome name="send" size={14} color="#fff" />}
+            <Text style={styles.actionPrimaryText}>Post / Schedule</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* bottom spacer so last buttons never hide behind footer */}
+        <View style={{ height: FOOTER_SPACER }} />
+      </ScrollView>
+
+      {/* Scheduler Modal */}
+      <Modal visible={pickerVisible} transparent animationType="fade" onRequestClose={() => setPickerVisible(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setPickerVisible(false)} />
+        <View style={styles.modalCard}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Pick date & time</Text>
+            <TouchableOpacity onPress={() => setPickerVisible(false)}><FontAwesome name="times" size={16} color={MUTED} /></TouchableOpacity>
+          </View>
+
+          {Platform.OS === "ios" ? (
+            <>
+              <DateTimePicker
+                mode="datetime"
+                display="spinner"
+                value={tempDate}
+                onChange={(_, d) => d && setTempDate(d)}
+                textColor={TEXT as any}
+                themeVariant="light"
+                style={{ alignSelf:"stretch" }}
+              />
+              <TouchableOpacity onPress={confirmPickerIOS} style={[styles.actionBtn, styles.btnPrimary, { marginTop: 10 }]}>
+                <Text style={styles.actionPrimaryText}>Done</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
+              <View style={{ gap: 12 }}>
+                {step === "date" ? (
+                  <DateTimePicker mode="date" display="calendar" value={tempDate} onChange={onChangeAndroid} />
+                ) : (
+                  <DateTimePicker mode="time" display="clock" value={tempDate} onChange={onChangeAndroid} />
+                )}
+              </View>
+              <Text style={{ color: MUTED, fontSize: 12, marginTop: 10 }}>
+                {step === "date" ? "Pick a date…" : "Now pick a time…"}
+              </Text>
+            </>
+          )}
+        </View>
       </Modal>
-    </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
-/* ---- UI bits ---- */
-const QuickChip = ({ label, onPress }) => (
-  <TouchableOpacity onPress={onPress} activeOpacity={0.9} style={styles.quickChip}>
-    <Text style={styles.quickChipText}>{label}</Text>
-  </TouchableOpacity>
-);
-
-/* ---- Helpers ---- */
-function getPreviewBoxStyleForPlatform(platform) {
-  switch (platform) {
-    case "Instagram": return { aspectRatio: 1 / 1 };
-    case "TikTok": return { aspectRatio: 9 / 16 };
-    case "YouTube": return { aspectRatio: 16 / 9 };
-    case "X (Twitter)": return { aspectRatio: 16 / 9 };
-    case "Facebook": return { aspectRatio: 4 / 5 };
-    default: return { aspectRatio: 1 / 1 };
-  }
-}
-function combineDateAndTime(d, t) {
-  const out = new Date(d);
-  out.setHours(t.getHours(), t.getMinutes(), 0, 0);
-  return out;
-}
-function atTodayOrTomorrow(hour, min) {
-  const d = new Date();
-  d.setHours(hour, min, 0, 0);
-  if (d < new Date()) d.setDate(d.getDate() + 1);
-  return d;
-}
-function addDaysAtTime(base, days, hour, min) {
-  const d = new Date(base);
-  d.setDate(d.getDate() + days);
-  d.setHours(hour, min, 0, 0);
-  return d;
-}
-function nextWeekdayAtTime(weekdayMon1, hour, min) {
-  // weekdayMon1: Mon=1 ... Sun=7
-  const now = new Date();
-  const day = now.getDay(); // Sun=0..Sat=6
-  const currentMon1 = day === 0 ? 7 : day;
-  let diff = weekdayMon1 - currentMon1;
-  if (diff <= 0) diff += 7;
-  const next = new Date(now);
-  next.setDate(now.getDate() + diff);
-  next.setHours(hour, min, 0, 0);
-  return next;
-}
-
-/* ---- Styles ---- */
+/* -------------------------
+   Styles
+--------------------------*/
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#F8FAFC" },
-
-  headerBlock: { paddingHorizontal: SPACING, gap: 4 },
-  title: { fontSize: 22, fontWeight: "800", color: "#0F172A" },
-  subtitle: { fontSize: 13, color: "#64748B" },
-
-  sectionHeader: {
-    paddingHorizontal: SPACING,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-end",
+  container: { flex: 1, backgroundColor: BG },
+  content: {
+    paddingHorizontal: 16,
+    paddingTop: HEADER_SPACER,   // TOP SAFE SPACE
+    paddingBottom: FOOTER_SPACER // BOTTOM SAFE SPACE
   },
-  sectionTitle: { fontSize: 16, fontWeight: "800", color: "#111827" },
-  sectionHint: { fontSize: 12, color: "#6B7280" },
 
-  card: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: RADIUS,
-    padding: SPACING,
-    marginHorizontal: SPACING,
+  topBar: { flexDirection:"row", alignItems:"center", marginBottom: 6 },
+  title: { fontSize: 22, fontWeight: "800", color: TEXT },
+  warnPill: {
+    marginLeft: "auto",
+    backgroundColor: "#FEF2F2",
+    borderColor: "#FECACA",
     borderWidth: 1,
-    borderColor: "#E5E7EB",
-    shadowColor: "#0f172a",
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 2,
-  },
-  cardSelected: { borderColor: "#93C5FD", backgroundColor: "#F8FAFF" },
-
-  templateCard: { width: 260, gap: 6 },
-  templateName: { fontSize: 14, fontWeight: "800", color: "#0F172A" },
-  templateCaption: { fontSize: 12, color: "#334155" },
-  templateNote: { fontSize: 11, color: "#64748B" },
-
-  platformRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  chip: {
     borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: "#FFFFFF",
-  },
-  chipText: { fontSize: 13, color: "#1F2937" },
-
-  uploadBtn: {
-    borderStyle: "dashed",
-    borderWidth: 2,
-    borderColor: "#CBD5E1",
-    borderRadius: 14,
-    paddingVertical: 24,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    flexDirection: "row",
     alignItems: "center",
     gap: 6,
-    backgroundColor: "#F8FAFF",
   },
-  uploadBtnText: { color: "#2563EB", fontWeight: "800", fontSize: 14 },
-  uploadSub: { color: "#64748B", fontSize: 12 },
+  warnText: { color: "#991B1B", fontSize: 12, fontWeight: "700" },
 
-  mediaHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
-  mediaMeta: { color: "#64748B", fontSize: 12, fontWeight: "600" },
-  selectedMediaBox: {
-    width: "100%",
-    height: 240,
-    borderRadius: 12,
-    overflow: "hidden",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    backgroundColor: "#F1F5F9",
-  },
+  section: { marginTop: 12 },
+  sectionLabel: { fontSize: 13, fontWeight: "800", color: TEXT, marginBottom: 8 },
 
-  ghostBtn: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    backgroundColor: "#FFFFFF",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+  chipsRow: { flexDirection: "row", alignItems:"center", gap: 10 },
+  chipBig: {
+    flexDirection:"row", alignItems:"center", gap: 6,
+    borderWidth: 1, borderColor: BORDER, backgroundColor:"#F8FAFC",
+    paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12,
   },
-  ghostBtnText: { color: "#0F172A", fontWeight: "700" },
-  ghostDanger: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#FCA5A5",
-    backgroundColor: "#FEF2F2",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  ghostDangerText: { color: "#B91C1C", fontWeight: "700" },
+  chipBigActive: { backgroundColor: TINT, borderColor: TINT },
+  chipBigText: { fontWeight:"800", color: TEXT, fontSize: 13 },
+  chipBigTextActive: { color:"#fff" },
+  chipDisabled: { opacity: 0.5 },
 
-  input: {
-    backgroundColor: "#F9FAFB",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    color: "#111827",
-    minHeight: 100,
-    textAlignVertical: "top",
+  iconBtnLite: {
+    marginLeft: "auto",
+    flexDirection:"row", alignItems:"center", gap: 6,
+    backgroundColor: "#F3F4F6",
+    paddingVertical: 8, paddingHorizontal: 10,
+    borderRadius: 10, borderWidth: 1, borderColor: BORDER,
   },
-  captionActions: {
-    flexDirection: "row",
-    gap: 8,
-    marginTop: 12,
-    justifyContent: "flex-end",
+  iconBtnLiteText: { fontWeight:"800", color: TINT, fontSize: 12 },
+
+  emptyBox: {
+    borderWidth: 1, borderColor: BORDER, borderRadius: 12,
+    padding: 24, alignItems: "center", justifyContent: "center",
   },
 
-  row: { flexDirection: "row", alignItems: "center" },
-  rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  platformDot: { width: 10, height: 10, borderRadius: 10, marginRight: 8 },
+  mediaThumbWrap: { position: "relative" },
+  mediaThumb: { width: 110, height: 140, borderRadius: 12, backgroundColor: "#E5E7EB" },
+  playBadge: { position: "absolute", right: 8, bottom: 8, backgroundColor:"rgba(0,0,0,0.6)", borderRadius: 999, padding: 6 },
+  removeBadge: { position: "absolute", top: -6, right: -6, backgroundColor:"rgba(0,0,0,0.7)", borderRadius: 999, padding: 6 },
 
-  mediaFrame: {
-    width: "100%",
-    borderRadius: 12,
-    marginTop: 12,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    overflow: "hidden",
-    backgroundColor: "#F1F5F9",
-  },
-  mediaFramedImage: { width: "100%", height: "100%" },
+  cropRow: { flexDirection:"row", alignItems:"center", gap: 8, marginTop: 10 },
+  subtle: { color: MUTED, fontSize: 12 },
+  chipSmall: { borderWidth:1, borderColor:"transparent", backgroundColor:"#111827", paddingVertical:6, paddingHorizontal:10, borderRadius:999 },
+  chipSmallText: { color:"#fff", fontWeight:"800", fontSize:12 },
 
-  previewPlatform: { fontSize: 14, fontWeight: "800", color: "#0F172A" },
-  previewBadge: {
-    backgroundColor: "#EEF2FF",
-    borderColor: "#C7D2FE",
-    borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
-    color: "#3730A3",
-    fontWeight: "800",
-    overflow: "hidden",
-  },
-  previewCaption: { marginTop: 10, color: "#334155", fontSize: 13 },
+  captionBox: { borderWidth:1, borderColor:BORDER, borderRadius:12, padding: 10 },
+  captionInput: { minHeight: 70, textAlignVertical: "top", color: TEXT },
+  counter: { marginTop: 6, color: MUTED, fontSize: 11, textAlign: "right" },
 
-  centerCard: { alignItems: "center" },
-  emptyText: { color: "#64748B", fontSize: 13, textAlign: "center" },
+  previewTabs: { flexDirection:"row", gap: 8, marginBottom: 8 },
+  tabPill: { backgroundColor:"#F3F4F6", borderWidth:1, borderColor:BORDER, borderRadius:999, paddingVertical:6, paddingHorizontal:10 },
+  tabText: { fontWeight:"800", color: TEXT, fontSize: 12 },
 
-  actionsRow: {
-    paddingHorizontal: SPACING,
-    flexDirection: "row",
-    gap: 12,
-  },
-  primaryBtn: {
-    backgroundColor: "#2563EB",
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    flex: 1,
-  },
-  primaryBtnText: { color: "#FFFFFF", fontWeight: "800", textAlign: "center", fontSize: 14 },
-  secondaryBtn: {
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#2563EB",
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    flex: 1,
-  },
-  secondaryBtnText: { color: "#2563EB", fontWeight: "800", textAlign: "center", fontSize: 14 },
+  previewCard: { borderWidth:1, borderColor:BORDER, borderRadius:14, overflow:"hidden", backgroundColor:"#fff" },
+  previewHeader: { flexDirection:"row", alignItems:"center", gap: 8, padding: 10, borderBottomWidth:1, borderBottomColor:BORDER },
+  previewTitle: { fontWeight:"800", color: TEXT, fontSize: 14 },
+  avatarSm: { width: 28, height: 28, borderRadius:14, backgroundColor: "#111827", alignItems:"center", justifyContent:"center" },
+  avatarSmText: { color:"#fff", fontWeight:"800", fontSize: 12 },
+  previewMedia: { width:"100%", height:260, backgroundColor:"#E5E7EB" },
+  videoOverlay: { position:"absolute", top:"45%", left:"45%", backgroundColor:"rgba(0,0,0,0.4)", padding:10, borderRadius:999 },
+  previewCaption: { padding: 10, color: TEXT },
 
-  /* Modal */
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(15, 23, 42, 0.4)",
-    justifyContent: "flex-end",
-  },
+  rowBetween: { flexDirection:"row", alignItems:"center", justifyContent:"space-between" },
+
+  timeChipWrap: { flexDirection:"row", flexWrap:"wrap", gap: 8, marginTop: 8 },
+  timeChip: { position:"relative" },
+  timeChipInner: { flexDirection:"row", alignItems:"center", gap:6, backgroundColor: TINT, paddingVertical:8, paddingHorizontal:12, borderRadius: 999 },
+  timeChipText: { color:"#fff", fontWeight:"800", fontSize: 12 },
+  timeChipX: { position:"absolute", top:-6, right:-6, backgroundColor:"#111827", borderRadius:999, padding:4, borderWidth:1, borderColor:"#fff" },
+
+  actionRow: { flexDirection:"row", gap: 10, marginTop: 16 },
+  actionBtn: { flex:1, borderRadius: 12, paddingVertical: 12, alignItems:"center", justifyContent:"center", flexDirection:"row", gap:8 },
+  btnPrimary: { backgroundColor: "#111827" },
+  actionPrimaryText: { color:"#fff", fontWeight:"800", fontSize: 14 },
+  btnGhost: { borderWidth: 1, borderColor: BORDER, backgroundColor:"#fff" },
+  actionGhostText: { color:"#111827", fontWeight:"800", fontSize: 14 },
+  disabled: { opacity: 0.6 },
+
+  // Modal
+  modalBackdrop: { flex:1, backgroundColor:"rgba(0,0,0,0.25)" },
   modalCard: {
-    backgroundColor: "#FFFFFF",
-    padding: SPACING,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    gap: 10,
+    position:"absolute", left:16, right:16, bottom: 24,
+    backgroundColor:"#fff", borderRadius: 16, borderWidth:1, borderColor:BORDER,
+    padding: 12, shadowColor:"#000", shadowOpacity:0.08, shadowOffset:{width:0, height:6}, shadowRadius:12, elevation:3
   },
-  modalTitle: { fontSize: 18, fontWeight: "800", color: "#0F172A" },
-  modalClose: { padding: 6, marginRight: -6 },
-  modalCloseText: { fontSize: 18, color: "#334155" },
-  modalHint: { fontSize: 12, color: "#64748B", marginTop: 4 },
-
-  quickRow: { flexDirection: "row", gap: 8, marginTop: 8 },
-  quickChip: {
-    backgroundColor: "#F1F5F9",
-    borderColor: "#E2E8F0",
-    borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 12,
-  },
-  quickChipText: { color: "#0F172A", fontWeight: "700", fontSize: 12 },
-
-  divider: {
-    height: 1,
-    backgroundColor: "#E5E7EB",
-    marginVertical: 10,
-  },
-
-  selectedRow: {
-    marginTop: 8,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: "#D1D5DB",
-    borderRadius: 12,
-    backgroundColor: "#F8FAFC",
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  selectedText: { color: "#0F172A", fontWeight: "700" },
-
-  modalActions: { flexDirection: "row", gap: 10, marginTop: 10 },
-  modalPrimary: {
-    backgroundColor: "#2563EB",
-    paddingVertical: 12,
-    borderRadius: 12,
-    flex: 1,
-    alignItems: "center",
-  },
-  modalSecondary: {
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#2563EB",
-    paddingVertical: 12,
-    borderRadius: 12,
-    flex: 1,
-    alignItems: "center",
-  },
+  modalHeader: { flexDirection:"row", alignItems:"center" },
+  modalTitle: { color: TEXT, fontWeight:"800", fontSize: 15, marginRight: "auto" },
 });

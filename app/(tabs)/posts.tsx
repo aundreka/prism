@@ -1,424 +1,287 @@
-import React, { useMemo, useState } from "react";
-import {
-  View,
-  Text,
-  FlatList,
-  TouchableOpacity,
-  StyleSheet,
-  ScrollView,
-  TextInput,
-  Alert,
-} from "react-native";
+// app/(tabs)/posts.tsx
+import React, { useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { FontAwesome } from "@expo/vector-icons";
+import { supabase } from "@/lib/supabase";
+import { router } from "expo-router";
 
-const PLATFORM_COLORS = {
-  Instagram: "#E1306C",
-  Facebook: "#1877F2",
-  TikTok: "#111111",
-  "X (Twitter)": "#1DA1F2",
-  YouTube: "#FF0000",
-};
-const ALL_PLATFORMS = Object.keys(PLATFORM_COLORS);
-const STATUS = ["All", "Published", "Scheduled", "Draft"];
+type PlatformEnum = "facebook" | "instagram";
+type PostStatusEnum = "draft" | "scheduled" | "posting" | "posted" | "failed" | "canceled";
 
-const INITIAL_POSTS = [
-  { id: "1", platform: "Instagram", status: "Published", caption: "Carousel: Studio lighting before/after ✨", date: "2025-10-22T10:15:00", metrics: { reach: 14210, likes: 1820, comments: 210, saves: 130 } },
-  { id: "2", platform: "TikTok", status: "Published", caption: "30s edit: Color grading on mobile 🎨", date: "2025-10-23T18:05:00", metrics: { views: 20120, hearts: 3560, comments: 420, shares: 260 } },
-  { id: "3", platform: "Facebook", status: "Published", caption: "BTS album from today’s shoot 📸", date: "2025-10-21T14:30:00", metrics: { reach: 11200, reactions: 980, comments: 140, shares: 96 } },
-  { id: "4", platform: "Facebook", status: "Scheduled", caption: "Weekend drop: Limited bundle with freebies 🎁", date: "2025-10-24T09:00:00" },
-  { id: "5", platform: "YouTube", status: "Scheduled", caption: "Vlog #12: Rebranding journey & lessons learned", date: "2025-10-25T19:00:00" },
-  { id: "6", platform: "X (Twitter)", status: "Draft", caption: "Poll: Which colorway should we drop next?", date: "2025-10-26T08:00:00" },
-  { id: "7", platform: "Instagram", status: "Draft", caption: "Story idea: quick rig setup + gear list", date: "2025-10-27T11:00:00" },
-];
+type PostRow = { id: string; user_id: string; caption: string | null; post_type: string; created_at: string; };
+type ScheduledRow = { id: string; post_id: string | null; status: PostStatusEnum; platform: PlatformEnum; api_post_id: string | null; scheduled_at: string | null; posted_at: string | null; };
+type MetricEnum = "impressions" | "reach" | "likes" | "comments" | "shares" | "saves" | "profile_visits" | "follows" | "clicks" | "video_views" | "engagement";
+type AnalyticsRow = { object_id: string | null; metric: MetricEnum; value: number; };
+
+const BG = "#F8FAFC";
+const TEXT = "#0F172A";
+const MUTED = "#64748B";
+const BORDER = "#E5E7EB";
+const TINT = "#111827";
+
+const ALL_STATUS: PostStatusEnum[] = ["draft","scheduled","posting","posted","failed","canceled"];
+const ALL_PLATFORM: PlatformEnum[] = ["instagram","facebook"];
 
 export default function PostsScreen() {
-  // Filters
-  const [platformFilter, setPlatformFilter] = useState("All");
-  const [statusFilter, setStatusFilter] = useState("All");
+  const [loading, setLoading] = useState(true);
+  const [posts, setPosts] = useState<PostRow[]>([]);
+  const [sched, setSched] = useState<ScheduledRow[]>([]);
+  const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
 
-  // Data
-  const [posts, setPosts] = useState(INITIAL_POSTS);
+  // filters
+  const [activePlatforms, setActivePlatforms] = useState<PlatformEnum[]>(["instagram","facebook"]);
+  const [activeStatuses, setActiveStatuses] = useState<PostStatusEnum[]>(["scheduled","posting","posted","failed","canceled","draft"]);
 
-  // Composer state
-  const [composerCaption, setComposerCaption] = useState("");
-  const [composerPlatform, setComposerPlatform] = useState("Instagram");
-  const [composerWhen, setComposerWhen] = useState(""); // free-text date/time, optional
+  useEffect(() => {
+    (async () => {
+      try {
+        setLoading(true);
+        const { data } = await supabase.auth.getUser();
+        const user = data?.user;
+        if (!user) { Alert.alert("Sign in required","Please sign in."); return; }
 
-  const filtered = useMemo(() => {
-    return posts
-      .filter((p) => (platformFilter === "All" ? true : p.platform === platformFilter))
-      .filter((p) => (statusFilter === "All" ? true : p.status === statusFilter))
-      .sort((a, b) => new Date(b.date) - new Date(a.date));
-  }, [platformFilter, statusFilter, posts]);
+        const { data: p, error: e1 } = await supabase
+          .from("posts")
+          .select("id,user_id,caption,post_type,created_at")
+          .eq("user_id", user.id)
+          .order("created_at", { ascending: false })
+          .limit(200);
+        if (e1) throw e1;
+        const postsData = (p || []) as PostRow[];
+        setPosts(postsData);
 
-  const renderChip = (label, active, onPress, color) => (
-    <TouchableOpacity
-      key={label}
-      onPress={onPress}
-      activeOpacity={0.85}
-      style={[
-        styles.chip,
-        active && { backgroundColor: "#DBEAFE", borderColor: "#93C5FD" },
-        color && { borderColor: color },
-      ]}
-    >
-      <Text style={[styles.chipText, active && { color: "#1E3A8A", fontWeight: "700" }]}>{label}</Text>
-    </TouchableOpacity>
-  );
+        if (postsData.length === 0) { setSched([]); setAnalytics([]); return; }
 
-  const renderStatusPill = (status) => {
-    const base = [styles.pill];
-    if (status === "Published") base.push({ backgroundColor: "#DCFCE7", borderColor: "#16A34A" });
-    if (status === "Scheduled") base.push({ backgroundColor: "#DBEAFE", borderColor: "#2563EB" });
-    if (status === "Draft") base.push({ backgroundColor: "#F3F4F6", borderColor: "#D1D5DB" });
-    return (
-      <View style={base}>
-        <Text style={styles.pillText}>{status}</Text>
-      </View>
-    );
-  };
+        const postIds = postsData.map((x) => x.id);
+        const { data: s, error: e2 } = await supabase
+          .from("scheduled_posts")
+          .select("id,post_id,status,platform,api_post_id,scheduled_at,posted_at")
+          .in("post_id", postIds)
+          .order("scheduled_at", { ascending: false });
+        if (e2) throw e2;
+        const schedData = (s || []) as ScheduledRow[];
+        setSched(schedData);
 
-  const capitalize = (s) => s.slice(0, 1).toUpperCase() + s.slice(1);
+        const apiIds = schedData.map((x) => x.api_post_id).filter((x): x is string => !!x);
+        if (apiIds.length) {
+          const { data: a, error: e3 } = await supabase
+            .from("analytics_events")
+            .select("object_id,metric,value")
+            .in("object_id", apiIds);
+          if (e3) throw e3;
+          setAnalytics((a || []) as AnalyticsRow[]);
+        } else {
+          setAnalytics([]);
+        }
+      } catch (e: any) {
+        console.error(e);
+        Alert.alert("Error", e?.message ?? "Failed to load posts.");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
 
-  const renderPost = ({ item }) => {
-    const color = PLATFORM_COLORS[item.platform] || "#111827";
-    const dt = new Date(item.date);
-    const dateStr = dt.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
+  // Groupings
+  const schedByPost = useMemo(() => {
+    const map = new Map<string, ScheduledRow[]>();
+    for (const s of sched) {
+      if (!s.post_id) continue;
+      if (!map.has(s.post_id)) map.set(s.post_id, []);
+      map.get(s.post_id)!.push(s);
+    }
+    return map;
+  }, [sched]);
+
+  const analyticsByApi = useMemo(() => {
+    const map = new Map<string, Record<string, number>>();
+    for (const a of analytics) {
+      if (!a.object_id) continue;
+      if (!map.has(a.object_id)) map.set(a.object_id, {});
+      const bucket = map.get(a.object_id)!;
+      bucket[a.metric] = (bucket[a.metric] || 0) + (Number(a.value) || 0);
+    }
+    return map;
+  }, [analytics]);
+
+  // Filter predicate
+  const filteredPosts = useMemo(() => {
+    return posts.filter((p) => {
+      const srows = schedByPost.get(p.id) || [];
+      // include post if ANY of its schedules match filters; if it has no schedules, include only if 'draft' selected
+      if (srows.length === 0) {
+        return activeStatuses.includes("draft");
+      }
+      return srows.some((s) => activePlatforms.includes(s.platform) && activeStatuses.includes(s.status));
     });
+  }, [posts, schedByPost, activePlatforms, activeStatuses]);
 
+  function summarizePostAnalytics(postId: string) {
+    const srows = (schedByPost.get(postId) || []).filter((x) => activePlatforms.includes(x.platform));
+    const apiIds = srows.map((x) => x.api_post_id).filter((x): x is string => !!x);
+    let engagement=0, impressions=0, likes=0, comments=0, shares=0, saves=0, videoViews=0;
+    for (const id of apiIds) {
+      const b = analyticsByApi.get(id) || {};
+      engagement += b["engagement"] || 0;
+      impressions += b["impressions"] || 0;
+      likes += b["likes"] || 0;
+      comments += b["comments"] || 0;
+      shares += b["shares"] || 0;
+      saves += b["saves"] || 0;
+      videoViews += b["video_views"] || 0;
+    }
+    return { engagement, impressions, likes, comments, shares, saves, videoViews };
+  }
+
+  function summarizeStatuses(postId: string) {
+    const srows = (schedByPost.get(postId) || []).filter((x) => activePlatforms.includes(x.platform));
+    const counts: Record<PostStatusEnum, number> = { draft:0, scheduled:0, posting:0, posted:0, failed:0, canceled:0 };
+    const platforms = new Set<PlatformEnum>();
+    for (const s of srows) {
+      counts[s.status] = (counts[s.status] || 0) + 1;
+      platforms.add(s.platform);
+    }
+    return { counts, platforms: Array.from(platforms) };
+  }
+
+  function togglePlatform(p: PlatformEnum) {
+    setActivePlatforms((prev) => prev.includes(p) ? prev.filter(x => x!==p) : [...prev, p]);
+  }
+  function toggleStatus(s: PostStatusEnum) {
+    setActiveStatuses((prev) => prev.includes(s) ? prev.filter(x => x!==s) : [...prev, s]);
+  }
+
+  if (loading) {
     return (
-      <View style={styles.card}>
-        <View style={styles.rowBetween}>
-          <View style={styles.row}>
-            <View style={[styles.platformDot, { backgroundColor: color }]} />
-            <Text style={styles.platformName}>{item.platform}</Text>
-          </View>
-          {renderStatusPill(item.status)}
-        </View>
-
-        <Text style={styles.caption}>{item.caption}</Text>
-
-        <View style={styles.rowBetween}>
-          <Text style={styles.date}>{dateStr}</Text>
-          {item.status === "Published" ? (
-            <Text style={styles.metricsText}>
-              {item.metrics?.reach
-                ? `Reach ${item.metrics.reach.toLocaleString()}`
-                : item.metrics?.views
-                ? `${item.metrics.views.toLocaleString()} views`
-                : `—`}{" "}
-              •{" "}
-              {item.metrics
-                ? Object.entries(item.metrics)
-                    .filter(([k]) => !["reach", "views"].includes(k))
-                    .map(([k, v]) => `${capitalize(k)} ${v}`)
-                    .join(" • ")
-                : "No metrics"}
-            </Text>
-          ) : item.status === "Scheduled" ? (
-            <Text style={styles.metricsText}>Scheduled</Text>
-          ) : (
-            <Text style={styles.metricsText}>Draft</Text>
-          )}
-        </View>
+      <View style={[styles.container, { alignItems: "center", justifyContent: "center" }]}>
+        <ActivityIndicator />
+        <Text style={{ color: MUTED, marginTop: 8 }}>Loading posts…</Text>
       </View>
     );
-  };
-
-  // --- Composer actions ---
-  const publishNow = () => {
-    if (!composerCaption.trim()) {
-      Alert.alert("Add a caption", "Please enter a caption before publishing.");
-      return;
-    }
-    const now = new Date();
-    const newPost = {
-      id: `${Date.now()}`,
-      platform: composerPlatform,
-      status: "Published",
-      caption: composerCaption.trim(),
-      date: now.toISOString(),
-      metrics: { reach: 0, likes: 0, comments: 0 }, // mock
-    };
-    setPosts((prev) => [newPost, ...prev]);
-    setComposerCaption("");
-    setComposerWhen("");
-  };
-
-  const schedulePost = () => {
-    if (!composerCaption.trim()) {
-      Alert.alert("Add a caption", "Please enter a caption to schedule.");
-      return;
-    }
-    if (!composerWhen.trim()) {
-      Alert.alert("Pick a time", "Enter a date/time (e.g., 2025-11-01 18:00).");
-      return;
-    }
-    const parsed = parseUserDate(composerWhen);
-    if (!parsed) {
-      Alert.alert("Invalid date", "Try formats like: 2025-11-01 18:00 or Nov 1, 2025 6:00 PM.");
-      return;
-    }
-    const newPost = {
-      id: `${Date.now()}`,
-      platform: composerPlatform,
-      status: parsed > new Date() ? "Scheduled" : "Published",
-      caption: composerCaption.trim(),
-      date: parsed.toISOString(),
-    };
-    setPosts((prev) => [newPost, ...prev]);
-    setComposerCaption("");
-    setComposerWhen("");
-  };
+  }
 
   return (
     <View style={styles.container}>
-      <FlatList
-        data={filtered}
-        keyExtractor={(item) => item.id}
-        renderItem={renderPost}
-        contentContainerStyle={{ paddingTop: 110, paddingBottom: 90 }}
-        showsVerticalScrollIndicator={false}
-        ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
-        ListHeaderComponent={
-          <View>
-            {/* Title */}
-            <View style={styles.headerBlock}>
-              <Text style={styles.title}>Posts</Text>
-              <Text style={styles.subtitle}>Compose, schedule, and review content</Text>
-            </View>
+      <Text style={styles.title}>Posts</Text>
 
-            {/* Inline Composer */}
-            <View style={styles.composerCard}>
-              <Text style={styles.composerLabel}>Compose</Text>
+      {/* Filters */}
+      <View style={styles.filterCard}>
+        <Text style={styles.filterLabel}>Platforms</Text>
+        <View style={styles.chipsRow}>
+          {ALL_PLATFORM.map((p) => {
+            const active = activePlatforms.includes(p);
+            return (
+              <TouchableOpacity key={p} onPress={() => togglePlatform(p)} style={[styles.chip, active && styles.chipActive]}>
+                {p === "instagram"
+                  ? <FontAwesome name="instagram" size={12} color={active ? "#fff" : "#C13584"} />
+                  : <FontAwesome name="facebook-square" size={12} color={active ? "#fff" : "#1877F2"} />}
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{p.toUpperCase()}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
 
-              {/* Platform selector (chips) */}
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={{ gap: 8 }}
-                style={{ marginBottom: 10 }}
-              >
-                {ALL_PLATFORMS.map((p) =>
-                  renderChip(
-                    p,
-                    composerPlatform === p,
-                    () => setComposerPlatform(p),
-                    PLATFORM_COLORS[p]
-                  )
-                )}
-              </ScrollView>
+        <Text style={[styles.filterLabel, { marginTop: 12 }]}>Status</Text>
+        <View style={styles.chipsRow}>
+          {ALL_STATUS.map((s) => {
+            const active = activeStatuses.includes(s);
+            return (
+              <TouchableOpacity key={s} onPress={() => toggleStatus(s)} style={[styles.chip, active && styles.chipActive]}>
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{s}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
 
-              {/* Caption */}
-              <TextInput
-                value={composerCaption}
-                onChangeText={setComposerCaption}
-                placeholder="Write a caption..."
-                placeholderTextColor="#94A3B8"
-                multiline
-                style={styles.input}
-              />
+      {filteredPosts.length === 0 ? (
+        <Text style={{ color: MUTED, marginTop: 8 }}>No posts matching filters.</Text>
+      ) : (
+        <FlatList
+          data={filteredPosts}
+          keyExtractor={(i) => i.id}
+          contentContainerStyle={{ paddingBottom: 32 }}
+          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          renderItem={({ item }) => {
+            const created = new Date(item.created_at).toLocaleString([], { month: "short", day: "numeric", year: "numeric" });
+            const { counts, platforms } = summarizeStatuses(item.id);
+            const a = summarizePostAnalytics(item.id);
 
-              {/* Date/Time (optional) */}
-              <View style={[styles.rowBetween, { marginTop: 8 }]}>
-                <TextInput
-                  value={composerWhen}
-                  onChangeText={setComposerWhen}
-                  placeholder="Schedule (optional): e.g., 2025-11-01 18:00"
-                  placeholderTextColor="#94A3B8"
-                  style={[styles.inputSmall, { flex: 1, marginRight: 8 }]}
-                />
-                <TouchableOpacity
-                  onPress={() => setComposerWhen(makeTonightAt(18))}
-                  style={[styles.ghostBtn]}
-                >
-                  <Text style={styles.ghostBtnText}>Tonight 6PM</Text>
-                </TouchableOpacity>
-              </View>
+            return (
+              <TouchableOpacity onPress={() => router.push(`/post/${item.id}`)} activeOpacity={0.85} style={styles.card}>
+                <View style={styles.row}>
+                  <Text numberOfLines={2} style={styles.caption}>{item.caption || "(no caption)"}</Text>
+                  <Text style={styles.created}>{created}</Text>
+                </View>
 
-              {/* Actions */}
-              <View style={[styles.rowBetween, { marginTop: 12 }]}>
-                <TouchableOpacity onPress={publishNow} activeOpacity={0.9} style={styles.primaryBtn}>
-                  <Text style={styles.primaryBtnText}>Publish Now</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={schedulePost} activeOpacity={0.9} style={styles.secondaryBtn}>
-                  <Text style={styles.secondaryBtnText}>Schedule</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
+                <View style={styles.badgesRow}>
+                  {platforms.includes("instagram") && (
+                    <View style={styles.badge}>
+                      <FontAwesome name="instagram" size={12} color="#C13584" />
+                      <Text style={styles.badgeText}>IG</Text>
+                    </View>
+                  )}
+                  {platforms.includes("facebook") && (
+                    <View style={styles.badge}>
+                      <FontAwesome name="facebook-square" size={12} color="#1877F2" />
+                      <Text style={styles.badgeText}>FB</Text>
+                    </View>
+                  )}
+                  <View style={styles.badgeMuted}><Text style={styles.badgeMutedText}>{item.post_type.toUpperCase()}</Text></View>
+                </View>
 
-            {/* Filters */}
-            <View style={styles.headerBlock}>
-              <Text style={styles.sectionTitle}>Filters</Text>
-            </View>
+                <View style={styles.statusRow}>
+                  {([["scheduled", counts.scheduled],["posting", counts.posting],["posted", counts.posted],["failed", counts.failed],["canceled", counts.canceled]] as Array<[string, number]>)
+                    .filter(([, n]) => n > 0)
+                    .map(([label, n]) => (
+                      <View key={label} style={styles.stateChip}><Text style={styles.stateChipText}>{label} • {n}</Text></View>
+                    ))}
+                </View>
 
-            {/* Platform filters */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={{ paddingHorizontal: 16, gap: 8 }}
-              style={{ marginBottom: 8 }}
-            >
-              {renderChip("All", platformFilter === "All", () => setPlatformFilter("All"))}
-              {ALL_PLATFORMS.map((p) =>
-                renderChip(p, platformFilter === p, () => setPlatformFilter(p), PLATFORM_COLORS[p])
-              )}
-            </ScrollView>
-
-            {/* Status filters */}
-            <View style={styles.statusRow}>
-              {STATUS.map((s) => renderChip(s, statusFilter === s, () => setStatusFilter(s)))}
-            </View>
-
-            {/* Section label */}
-            <View style={styles.headerBlock}>
-              <Text style={styles.sectionTitle}>All Posts</Text>
-            </View>
-          </View>
-        }
-      />
+                <View style={styles.analyticsRow}>
+                  <View style={styles.metric}><Text style={styles.mTitle}>Engagement</Text><Text style={styles.mValue}>{Math.round(a.engagement)}</Text></View>
+                  <View style={styles.metric}><Text style={styles.mTitle}>Impressions</Text><Text style={styles.mValue}>{Math.round(a.impressions)}</Text></View>
+                  <View style={styles.metric}><Text style={styles.mTitle}>Likes</Text><Text style={styles.mValue}>{Math.round(a.likes)}</Text></View>
+                  <View style={styles.metric}><Text style={styles.mTitle}>Comments</Text><Text style={styles.mValue}>{Math.round(a.comments)}</Text></View>
+                </View>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      )}
     </View>
   );
 }
 
-/* --- Small helpers --- */
-function parseUserDate(s) {
-  // Super forgiving parser for quick demos
-  // Accepts "YYYY-MM-DD HH:mm" or anything Date can parse.
-  const trimmed = s.replace(" at ", " ").replace("  ", " ").trim();
-  const tryIso = Date.parse(trimmed);
-  if (!Number.isNaN(tryIso)) return new Date(tryIso);
-  return null;
-}
-function makeTonightAt(hour = 18) {
-  const d = new Date();
-  d.setHours(hour, 0, 0, 0);
-  if (d < new Date()) d.setDate(d.getDate() + 1);
-  // Return a user-editable string
-  const yyyy = d.getFullYear();
-  const mm = `${d.getMonth() + 1}`.padStart(2, "0");
-  const dd = `${d.getDate()}`.padStart(2, "0");
-  const HH = `${d.getHours()}`.padStart(2, "0");
-  const MM = `${d.getMinutes()}`.padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${HH}:${MM}`;
-}
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#F8FAFC" },
+  container: { flex:1, backgroundColor: BG, paddingHorizontal:16, paddingTop:18 },
+  title: { fontSize:22, fontWeight:"800", color:TEXT, marginBottom:8 },
 
-  headerBlock: { paddingHorizontal: 16, marginBottom: 8 },
-  title: { fontSize: 22, fontWeight: "700", color: "#111827" },
-  subtitle: { fontSize: 13, color: "#6B7280", marginTop: 2 },
+  filterCard: { backgroundColor:"#fff", borderRadius:14, borderWidth:1, borderColor:BORDER, padding:12, marginBottom:10 },
+  filterLabel: { color:TEXT, fontWeight:"800", fontSize:13 },
+  chipsRow: { flexDirection:"row", flexWrap:"wrap", gap:8, marginTop:8 },
+  chip: { flexDirection:"row", alignItems:"center", gap:6, paddingVertical:6, paddingHorizontal:10, borderRadius:999, borderWidth:1, borderColor:BORDER, backgroundColor:"#F8FAFC" },
+  chipActive: { backgroundColor:TINT, borderColor:TINT },
+  chipText: { color:TEXT, fontWeight:"800", fontSize:12 },
+  chipTextActive: { color:"#fff" },
 
-  /* Composer */
-  composerCard: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    padding: 14,
-    marginHorizontal: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-  },
-  composerLabel: { fontSize: 14, fontWeight: "700", color: "#111827", marginBottom: 8 },
-  input: {
-    backgroundColor: "#F9FAFB",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: "#111827",
-    minHeight: 70,
-    textAlignVertical: "top",
-  },
-  inputSmall: {
-    backgroundColor: "#F9FAFB",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: "#111827",
-  },
-  primaryBtn: {
-    backgroundColor: "#2563EB",
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    flex: 1,
-    marginRight: 8,
-  },
-  primaryBtnText: { color: "#FFFFFF", fontWeight: "700", textAlign: "center" },
-  secondaryBtn: {
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#2563EB",
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    flex: 1,
-    marginLeft: 8,
-  },
-  secondaryBtnText: { color: "#2563EB", fontWeight: "700", textAlign: "center" },
-  ghostBtn: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    backgroundColor: "#FFFFFF",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  ghostBtnText: { color: "#111827", fontWeight: "600" },
+  card: { backgroundColor:"#fff", borderRadius:16, borderWidth:1, borderColor:BORDER, padding:14 },
+  row: { flexDirection:"row", alignItems:"flex-start" },
+  caption: { flex:1, color:TEXT, fontWeight:"700", fontSize:14 },
+  created: { marginLeft:10, color:MUTED, fontSize:12 },
 
-  /* Chips & filters */
-  chip: {
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: "#FFFFFF",
-  },
-  chipText: { fontSize: 13, color: "#1F2937" },
-  statusRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    paddingHorizontal: 16,
-    marginBottom: 10,
-  },
+  badgesRow: { flexDirection:"row", gap:8, marginTop:8 },
+  badge: { flexDirection:"row", gap:6, alignItems:"center", paddingVertical:4, paddingHorizontal:8, borderRadius:999, borderWidth:1, borderColor:BORDER, backgroundColor:"#F8FAFC" },
+  badgeText: { color:TEXT, fontWeight:"800", fontSize:11 },
+  badgeMuted: { paddingVertical:4, paddingHorizontal:8, borderRadius:999, borderWidth:1, borderColor:BORDER, backgroundColor:"#F3F4F6" },
+  badgeMutedText: { color:TEXT, fontWeight:"800", fontSize:11 },
 
-  /* Post cards */
-  card: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    padding: 14,
-    marginHorizontal: 16,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-  },
-  row: { flexDirection: "row", alignItems: "center" },
-  rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  statusRow: { flexDirection:"row", flexWrap:"wrap", gap:8, marginTop:10 },
+  stateChip: { paddingVertical:6, paddingHorizontal:10, borderRadius:999, backgroundColor:"#111827" },
+  stateChipText: { color:"#fff", fontWeight:"800", fontSize:11 },
 
-  platformDot: { width: 10, height: 10, borderRadius: 10, marginRight: 8 },
-  platformName: { fontSize: 14, fontWeight: "700", color: "#111827" },
-
-  caption: { color: "#374151", marginTop: 6, fontSize: 13 },
-
-  date: { color: "#6B7280", fontSize: 12, marginTop: 10 },
-  metricsText: { color: "#334155", fontSize: 12, marginTop: 10, textAlign: "right" },
-
-  pill: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
-    borderWidth: 1,
-    backgroundColor: "#F3F4F6",
-    borderColor: "#D1D5DB",
-  },
-  pillText: { fontSize: 11, fontWeight: "700", color: "#111827" },
+  analyticsRow: { flexDirection:"row", flexWrap:"wrap", gap:16, marginTop:12, borderTopWidth:1, borderTopColor:BORDER, paddingTop:10 },
+  metric: { minWidth:80 },
+  mTitle: { color:MUTED, fontSize:11 },
+  mValue: { color:TEXT, fontWeight:"800", fontSize:14, marginTop:2 },
 });
