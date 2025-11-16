@@ -13,14 +13,13 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
-import { useHeaderHeight } from "@react-navigation/elements"; // ⬅️ NEW
-import { useSafeAreaInsets } from "react-native-safe-area-context"; // ⬅️ NEW
+import { useHeaderHeight } from "@react-navigation/elements";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-// 🔔 Push helpers — make sure these names match your src/utils/push.ts exports
-// Suggested API: ensurePushReady(): Promise<void>, notify(opts: { title: string; body?: string; data?: any })
 import { ensurePushReady, notify } from "@/utils/push";
 
 type DBPlatform = "facebook";
@@ -30,10 +29,38 @@ type ConnectedMeta = {
   platform: DBPlatform;
   page_id: string | null;
   page_name: string | null;
-  ig_user_id: string | null;
-  ig_username?: string | null;
+  ig_user_id: string | null; // kept in type in case other screens use it
+  ig_username?: string | null; // but not used in this UI
   access_token: string;
   token_expires_at: string | null;
+};
+
+type Industry =
+  | "restaurant"
+  | "cafe"
+  | "clinic"
+  | "ecommerce"
+  | "coach_consultant"
+  | "content_creator"
+  | "agency"
+  | "education"
+  | "other";
+
+const INDUSTRY_OPTIONS: { value: Industry; label: string }[] = [
+  { value: "content_creator", label: "Content Creator" },
+  { value: "ecommerce", label: "E-commerce / Online Shop" },
+  { value: "restaurant", label: "Restaurant / Food" },
+  { value: "cafe", label: "Café / Beverage" },
+  { value: "clinic", label: "Clinic / Health" },
+  { value: "coach_consultant", label: "Coach / Consultant" },
+  { value: "agency", label: "Agency / Services" },
+  { value: "education", label: "Education" },
+  { value: "other", label: "Other" },
+];
+
+type BrandProfileRow = {
+  brand_name: string | null;
+  industry: Industry | null;
 };
 
 const OAUTH_BASE =
@@ -50,7 +77,7 @@ function initialsFrom(nameOrEmail?: string | null) {
   return (first + last) || first || "U";
 }
 
-/* ---------- Data Hook ---------- */
+/* ---------- Data Hook: Meta Connections ---------- */
 function useConnections() {
   const [rows, setRows] = useState<ConnectedMeta[]>([]);
   const [loading, setLoading] = useState(true);
@@ -101,13 +128,49 @@ export default function ProfileScreen() {
 
   const [displayName, setDisplayName] = useState<string | null>(null);
   const [email, setEmail] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
 
-  const headerHeight = useHeaderHeight();          // ⬅️ NEW
-  const insets = useSafeAreaInsets();              // ⬅️ NEW
+  // Brand profile state
+  const [brandName, setBrandName] = useState("");
+  const [industry, setIndustry] = useState<Industry>("other");
+  const [brandLoading, setBrandLoading] = useState(false);
+  const [brandSaving, setBrandSaving] = useState(false);
+  const [isEditingBrand, setIsEditingBrand] = useState(false);
+
+  const headerHeight = useHeaderHeight();
+  const insets = useSafeAreaInsets();
+
+  const loadBrandProfile = useCallback(
+    async (uid: string) => {
+      try {
+        setBrandLoading(true);
+        const { data, error } = await supabase
+          .from("brand_profiles")
+          .select("brand_name, industry")
+          .eq("user_id", uid)
+          .maybeSingle<BrandProfileRow>();
+        if (error && error.code !== "PGRST116") {
+          throw error;
+        }
+
+        if (data) {
+          setBrandName(data.brand_name ?? "");
+          setIndustry((data.industry as Industry | null) ?? "other");
+        } else {
+          setBrandName("");
+          setIndustry("other");
+        }
+      } catch (e: any) {
+        console.error("Load brand profile failed:", e?.message || e);
+      } finally {
+        setBrandLoading(false);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     (async () => {
-      // Ensure push is registered once when this tab mounts
       try {
         await ensurePushReady?.();
       } catch {}
@@ -119,11 +182,51 @@ export default function ProfileScreen() {
           null
       );
       setEmail(user?.email ?? null);
+      if (user?.id) {
+        setUserId(user.id);
+        await loadBrandProfile(user.id);
+      }
     })();
-  }, []);
+  }, [loadBrandProfile]);
+
+  const industryLabel = useMemo(
+    () => INDUSTRY_OPTIONS.find((opt) => opt.value === industry)?.label ?? "Other",
+    [industry]
+  );
+
+  const saveBrandProfile = useCallback(async () => {
+    if (!userId) {
+      Alert.alert("Sign in required", "Please sign in first.");
+      return;
+    }
+    try {
+      setBrandSaving(true);
+      const payload = {
+        user_id: userId,
+        brand_name: brandName.trim() || null,
+        industry,
+      };
+
+      const { error } = await supabase
+        .from("brand_profiles")
+        .upsert(payload, { onConflict: "user_id" });
+      if (error) throw error;
+
+      Alert.alert("Saved", "Brand profile updated.");
+      setIsEditingBrand(false);
+    } catch (e: any) {
+      console.error("Save brand profile failed:", e?.message || e);
+      Alert.alert("Error", e?.message ?? "Could not save brand profile.");
+    } finally {
+      setBrandSaving(false);
+    }
+  }, [userId, brandName, industry]);
 
   const userTag = displayName || email || "User";
-  const avatarText = useMemo(() => initialsFrom(displayName || email), [displayName, email]);
+  const avatarText = useMemo(
+    () => initialsFrom(displayName || email),
+    [displayName, email]
+  );
 
   const connectMeta = async () => {
     try {
@@ -157,31 +260,26 @@ export default function ProfileScreen() {
       });
 
       if (res.type === "success" && res.url?.includes("ok=1")) {
-        // Enrich IG (best-effort)
-        await fetch(`${OAUTH_BASE}/meta_ig_enrich`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ only_missing: true }),
-        }).catch(() => {});
-
         await refresh();
 
-        // 🔔 Push: Connected
+        // 🔔 Push: Connected (Facebook only)
         try {
           const latest = (await supabase
             .from("connected_meta_accounts")
-            .select("page_name,page_id,ig_user_id,ig_username")
+            .select("page_name,page_id")
             .eq("platform", "facebook")
             .order("created_at", { ascending: false })
             .limit(1)
             .single()).data as any;
 
           const pageLabel = latest?.page_name || latest?.page_id || "Facebook Page";
-          const igLabel = latest?.ig_username ? ` and @${latest.ig_username}` : "";
           await notify?.({
             title: "Meta account linked",
-            body: `Connected to ${pageLabel}${igLabel}.`,
-            data: { kind: "meta_connected", page_id: latest?.page_id, ig_user_id: latest?.ig_user_id },
+            body: `Connected to ${pageLabel}.`,
+            data: {
+              kind: "meta_connected",
+              page_id: latest?.page_id,
+            },
           });
         } catch {}
 
@@ -224,7 +322,6 @@ export default function ProfileScreen() {
     try {
       await supabase.auth.signOut();
 
-      // 🔔 Push: Optional sign-out notice (safe to remove if you don't want this)
       try {
         await notify?.({
           title: "Signed out",
@@ -251,7 +348,10 @@ export default function ProfileScreen() {
       style={styles.container}
       contentContainerStyle={[
         styles.content,
-        { paddingTop: headerHeight }, // ⬅️ NEW: safe space for header
+        {
+          paddingTop: headerHeight,
+          paddingBottom: insets.bottom + 24,
+        },
       ]}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
     >
@@ -291,12 +391,119 @@ export default function ProfileScreen() {
 
       {/* ---------- BODY ---------- */}
       <View style={styles.body}>
+        {/* Brand Profile Card */}
+        
+        <View style={styles.profilecard}>
+          <View style={styles.cardHeaderRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.cardTitle}>Brand Profile</Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => setIsEditingBrand((v) => !v)}
+              style={styles.editPill}
+              activeOpacity={0.9}
+              disabled={brandLoading || brandSaving || !userId}
+            >
+              <Text style={styles.editPillText}>
+                {isEditingBrand ? "Done" : brandName || industry ? "Edit" : "Set up"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          {brandLoading ? (
+            <View style={[styles.rowCenter, { marginTop: 12 }]}>
+              <ActivityIndicator />
+              <Text style={{ marginLeft: 8, color: "#6B7280", fontSize: 13 }}>Loading…</Text>
+            </View>
+          ) : (
+            <>
+              {/* Minimal summary view (always visible) */}
+              <View style={styles.summaryRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.summaryLabel}>Brand name</Text>
+                  <Text style={styles.summaryValue}>
+                    {brandName.trim() || "Not set"}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={[styles.summaryRow, { marginTop: 8 }]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.summaryLabel}>Industry</Text>
+                  <Text style={styles.summaryValue}>{industryLabel}</Text>
+                </View>
+              </View>
+
+              {/* Editable controls only when editing */}
+              {isEditingBrand && (
+                <>
+                  <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Brand name</Text>
+                  <TextInput
+                    value={brandName}
+                    onChangeText={setBrandName}
+                    placeholder="e.g. Salus Skin & Wellness Clinic"
+                    placeholderTextColor="#9CA3AF"
+                    style={styles.textInput}
+                    editable={!brandLoading && !brandSaving}
+                  />
+
+                  <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Industry</Text>
+                  <View style={styles.chipRow}>
+                    {INDUSTRY_OPTIONS.map((opt) => {
+                      const selected = industry === opt.value;
+                      return (
+                        <TouchableOpacity
+                          key={opt.value}
+                          style={[styles.chip, selected && styles.chipSelected]}
+                          onPress={() => setIndustry(opt.value)}
+                          activeOpacity={0.9}
+                          disabled={brandSaving}
+                        >
+                          <Text
+                            style={[
+                              styles.chipText,
+                              selected && styles.chipTextSelected,
+                            ]}
+                          >
+                            {opt.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  <TouchableOpacity
+                    onPress={saveBrandProfile}
+                    style={[
+                      styles.primaryBtn,
+                      (brandSaving || brandLoading || !userId) && styles.btnDisabled,
+                      { marginTop: 16 },
+                    ]}
+                    activeOpacity={0.92}
+                    disabled={brandSaving || brandLoading || !userId}
+                  >
+                    {brandSaving ? (
+                      <View style={styles.rowCenter}>
+                        <ActivityIndicator />
+                        <Text style={[styles.primaryBtnText, { marginLeft: 8 }]}>Saving…</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.primaryBtnText}>Save Brand Profile</Text>
+                    )}
+                  </TouchableOpacity>
+                </>
+              )}
+            </>
+          )}
+        </View>
+
+        {/* Meta Connection Card */}
         {!connected ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Connect your Meta account</Text>
             <Text style={styles.cardSubtle}>
-              Choose a Facebook Page. If it has an Instagram Professional account linked,
-              we’ll show its @username too.
+              Choose a Facebook Page to connect. We’ll use its analytics to power your
+              recommendations.
             </Text>
 
             <TouchableOpacity
@@ -327,22 +534,6 @@ export default function ProfileScreen() {
                 <Text style={styles.itemLabel}>Facebook Page</Text>
                 <Text style={styles.itemValue}>
                   {primary?.page_name || primary?.page_id || "—"}
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.itemRow}>
-              <View style={styles.itemIconWrap}>
-                <FontAwesome name="instagram" size={20} color="#C13584" />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.itemLabel}>Instagram</Text>
-                <Text style={styles.itemValue}>
-                  {primary?.ig_user_id
-                    ? primary?.ig_username
-                      ? `@${primary.ig_username}`
-                      : "(linked — fetch pending)"
-                    : "—"}
                 </Text>
               </View>
             </View>
@@ -399,10 +590,10 @@ const CARD_BG = "#FFFFFF";
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
-  content: { paddingBottom: 0 }, // top padding added dynamically
+  content: { paddingBottom: 0 },
   hero: {
     backgroundColor: "#111827",
-    paddingTop: 72,
+    paddingTop: 20,
     paddingHorizontal: 20,
     paddingBottom: 28,
     borderBottomLeftRadius: 24,
@@ -454,8 +645,40 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 3,
   },
+  profilecard: {
+    backgroundColor: CARD_BG,
+    borderRadius: 16,
+    padding: 16,
+    marginTop: 30,
+    borderWidth: 1,
+    borderColor: BORDER,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  cardHeaderRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+  },
   cardTitle: { fontSize: 16, fontWeight: "800", color: TEXT_DARK },
-  cardSubtle: { fontSize: 13, color: TEXT_MUTED, marginTop: 6 },
+  cardSubtle: { fontSize: 12, color: TEXT_MUTED, marginTop: 4 },
+  editPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "#F3F4F6",
+    borderWidth: 1,
+    borderColor: BORDER,
+    alignSelf: "flex-start",
+  },
+  editPillText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#111827",
+  },
   itemRow: {
     marginTop: 14,
     paddingVertical: 8,
@@ -508,4 +731,65 @@ const styles = StyleSheet.create({
   ghostDangerText: { color: "#B91C1C", fontWeight: "800", fontSize: 14 },
   btnDisabled: { opacity: 0.6 },
   rowCenter: { flexDirection: "row", alignItems: "center" },
+
+  // Brand profile styles
+  fieldLabel: {
+    marginTop: 12,
+    fontSize: 13,
+    fontWeight: "700",
+    color: TEXT_DARK,
+  },
+  textInput: {
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: TEXT_DARK,
+    backgroundColor: "#F9FAFB",
+  },
+  chipRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 8,
+  },
+  chip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F9FAFB",
+  },
+  chipSelected: {
+    backgroundColor: "#111827",
+    borderColor: "#111827",
+  },
+  chipText: {
+    fontSize: 12,
+    color: TEXT_MUTED,
+    fontWeight: "600",
+  },
+  chipTextSelected: {
+    color: "#F9FAFB",
+  },
+  summaryRow: {
+    marginTop: 14,
+    paddingVertical: 4,
+  },
+  summaryLabel: {
+    fontSize: 11,
+    color: TEXT_MUTED,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  summaryValue: {
+    fontSize: 14,
+    color: TEXT_DARK,
+    fontWeight: "700",
+    marginTop: 2,
+  },
 });

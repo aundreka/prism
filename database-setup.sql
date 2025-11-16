@@ -253,6 +253,8 @@ create table if not exists public.analytics_events (
   metric metric_enum not null,
   value numeric not null,
   ts timestamptz not null
+  constraint uq_analytics_event_unique unique (user_id, platform, object_id, metric, ts);
+
 );
 create index if not exists idx_analytics_user_ts on public.analytics_events(user_id, ts desc);
 create index if not exists idx_analytics_object_metric on public.analytics_events(object_id, metric);
@@ -316,6 +318,8 @@ create table if not exists public.features_engagement_timeslots (
   hour_dow_ctr_28d numeric,
   post_type_ctr_14d numeric,
   label_engagement numeric,
+  industry industry_enum,
+  constraint uq_feats_timeslot unique (user_id, platform, timeslot),
   created_at timestamptz not null default now_utc()
 );
 
@@ -695,9 +699,20 @@ from public.scheduled_posts sp;
 -- HELPERS & FEATURE BUILDER
 -- =========================
 create or replace function public.norm_engagement(
-  e numeric, p10 numeric, p90 numeric
-) returns numeric language sql immutable as $$
-  select greatest(0, least(1, (e - p10) / nullif(p90 - p10, 0)))
+  e numeric,
+  p10 double precision,
+  p90 double precision
+) returns numeric
+language sql
+immutable
+as $$
+  select greatest(
+    0,
+    least(
+      1,
+      (e - p10::numeric) / nullif(p90::numeric - p10::numeric, 0)
+    )
+  )
 $$;
 
 create or replace function public.build_timeslot_features(
@@ -705,13 +720,29 @@ create or replace function public.build_timeslot_features(
   p_platform platform_enum,
   p_history_days int default 90,
   p_future_days int default 14
-) returns json language plpgsql security definer as $$
+) returns json
+language plpgsql
+security definer
+as $$
 declare
   history_start timestamptz := now() - make_interval(days => p_history_days);
   history_end   timestamptz := now();
   future_end    timestamptz := now() + make_interval(days => p_future_days);
-  ins_hist bigint; ins_future bigint;
+  ins_hist      bigint;
+  ins_future    bigint;
+  v_industry    industry_enum;
 begin
+  -- Resolve user's industry once; fallback to 'other'
+  select bp.industry
+  into v_industry
+  from public.brand_profiles bp
+  where bp.user_id = p_user_id
+  limit 1;
+
+  if v_industry is null then
+    v_industry := 'other'::industry_enum;
+  end if;
+
   -- HISTORICAL (labels)
   with hist as (
     select
@@ -720,10 +751,10 @@ begin
       date_trunc('hour', ts)     as timeslot,
       extract(dow  from ts)::int as dow,
       extract(hour from ts)::int as hour,
-      sum(case when metric = 'likes'    then value else 0 end) as likes,
-      sum(case when metric = 'comments' then value else 0 end) as comments,
-      sum(case when metric = 'saves'    then value else 0 end) as saves,
-      sum(case when metric = 'shares'   then value else 0 end) as shares,
+      sum(case when metric = 'likes'       then value else 0 end) as likes,
+      sum(case when metric = 'comments'    then value else 0 end) as comments,
+      sum(case when metric = 'saves'       then value else 0 end) as saves,
+      sum(case when metric = 'shares'      then value else 0 end) as shares,
       sum(case when metric = 'impressions' then value else 0 end) as impressions
     from public.v_analytics_events_all
     where user_id = p_user_id
@@ -734,13 +765,21 @@ begin
   ),
   hist_e as (
     select
-      user_id, platform, timeslot, dow, hour,
-      (likes + comments + 0.5*saves + 0.2*shares) as engagement
+      user_id,
+      platform,
+      timeslot,
+      dow,
+      hour,
+      case
+        when impressions <= 0 then 0
+        else (likes + comments + 0.5*saves + 0.2*shares) / impressions
+      end as engagement
     from hist
   ),
   bounds as (
     select
-      user_id, platform,
+      user_id,
+      platform,
       percentile_cont(0.10) within group (order by engagement) as p10,
       percentile_cont(0.90) within group (order by engagement) as p90
     from hist_e
@@ -748,7 +787,11 @@ begin
   ),
   hist_norm as (
     select
-      h.user_id, h.platform, h.timeslot, h.dow, h.hour,
+      h.user_id,
+      h.platform,
+      h.timeslot,
+      h.dow,
+      h.hour,
       public.norm_engagement(h.engagement, b.p10, b.p90) as label_engagement
     from hist_e h
     join bounds b using (user_id, platform)
@@ -759,7 +802,7 @@ begin
       p_platform as platform,
       extract(dow  from ts)::int as dow,
       extract(hour from ts)::int as hour,
-      avg(case when metric = 'engagement' then value else null end) filter (where metric='engagement') as avg_engagement_hour_dow,
+      avg(case when metric = 'engagement'   then value else null end) filter (where metric='engagement')   as avg_engagement_hour_dow,
       avg(case when metric = 'impressions' then value else null end) filter (where metric='impressions') as avg_impr_hour_dow
     from public.v_analytics_events_all
     where user_id = p_user_id
@@ -774,7 +817,8 @@ begin
     seasonal_daily, seasonal_weekly,
     recent_avg_engagement, user_recent_avg_7d,
     hour_dow_ctr_28d, post_type_ctr_14d,
-    label_engagement
+    label_engagement,
+    industry
   )
   select
     h.user_id, h.platform, h.timeslot, h.dow, h.hour,
@@ -790,23 +834,27 @@ begin
       else (r.avg_engagement_hour_dow / r.avg_impr_hour_dow)
     end as hour_dow_ctr_28d,
     null::numeric as post_type_ctr_14d,
-    h.label_engagement
+    h.label_engagement,
+    v_industry as industry
   from hist_norm h
   left join recency r
-    on r.user_id = h.user_id and r.platform = h.platform
-   and r.dow = h.dow and r.hour = h.hour
+    on r.user_id = h.user_id
+   and r.platform = h.platform
+   and r.dow = h.dow
+   and r.hour = h.hour
   on conflict (user_id, platform, timeslot)
   do update set
-    dow = excluded.dow,
-    hour = excluded.hour,
-    seasonal_daily = excluded.seasonal_daily,
-    seasonal_weekly = excluded.seasonal_weekly,
+    dow                   = excluded.dow,
+    hour                  = excluded.hour,
+    seasonal_daily        = excluded.seasonal_daily,
+    seasonal_weekly       = excluded.seasonal_weekly,
     recent_avg_engagement = excluded.recent_avg_engagement,
-    user_recent_avg_7d = excluded.user_recent_avg_7d,
-    hour_dow_ctr_28d = excluded.hour_dow_ctr_28d,
-    post_type_ctr_14d = excluded.post_type_ctr_14d,
-    label_engagement = excluded.label_engagement,
-    created_at = now_utc()
+    user_recent_avg_7d    = excluded.user_recent_avg_7d,
+    hour_dow_ctr_28d      = excluded.hour_dow_ctr_28d,
+    post_type_ctr_14d     = excluded.post_type_ctr_14d,
+    label_engagement      = excluded.label_engagement,
+    industry              = excluded.industry,
+    created_at            = now_utc()
   ;
   get diagnostics ins_hist = row_count;
 
@@ -818,7 +866,11 @@ begin
       gs as timeslot,
       extract(dow  from gs)::int  as dow,
       extract(hour from gs)::int  as hour
-    from generate_series(date_trunc('hour', now()), date_trunc('hour', now() + make_interval(days => p_future_days)), interval '1 hour') as gs
+    from generate_series(
+      date_trunc('hour', now()),
+      date_trunc('hour', now() + make_interval(days => p_future_days)),
+      interval '1 hour'
+    ) as gs
   ),
   recency as (
     select
@@ -826,7 +878,7 @@ begin
       p_platform as platform,
       extract(dow  from ts)::int as dow,
       extract(hour from ts)::int as hour,
-      avg(case when metric = 'engagement' then value else null end) filter (where metric='engagement') as avg_engagement_hour_dow,
+      avg(case when metric = 'engagement'   then value else null end) filter (where metric='engagement')   as avg_engagement_hour_dow,
       avg(case when metric = 'impressions' then value else null end) filter (where metric='impressions') as avg_impr_hour_dow
     from public.v_analytics_events_all
     where user_id = p_user_id
@@ -841,7 +893,8 @@ begin
     seasonal_daily, seasonal_weekly,
     recent_avg_engagement, user_recent_avg_7d,
     hour_dow_ctr_28d, post_type_ctr_14d,
-    label_engagement
+    label_engagement,
+    industry
   )
   select
     f.user_id, f.platform, f.timeslot, f.dow, f.hour,
@@ -857,22 +910,26 @@ begin
       else (r.avg_engagement_hour_dow / r.avg_impr_hour_dow)
     end as hour_dow_ctr_28d,
     null::numeric as post_type_ctr_14d,
-    null::numeric as label_engagement
+    null::numeric as label_engagement,
+    v_industry as industry
   from future_slots f
   left join recency r
-    on r.user_id = f.user_id and r.platform = f.platform
-   and r.dow = f.dow and r.hour = f.hour
+    on r.user_id = f.user_id
+   and r.platform = f.platform
+   and r.dow = f.dow
+   and r.hour = f.hour
   on conflict (user_id, platform, timeslot)
   do update set
-    dow = excluded.dow,
-    hour = excluded.hour,
-    seasonal_daily = excluded.seasonal_daily,
-    seasonal_weekly = excluded.seasonal_weekly,
+    dow                   = excluded.dow,
+    hour                  = excluded.hour,
+    seasonal_daily        = excluded.seasonal_daily,
+    seasonal_weekly       = excluded.seasonal_weekly,
     recent_avg_engagement = excluded.recent_avg_engagement,
-    user_recent_avg_7d = excluded.user_recent_avg_7d,
-    hour_dow_ctr_28d = excluded.hour_dow_ctr_28d,
-    post_type_ctr_14d = excluded.post_type_ctr_14d,
-    created_at = now_utc()
+    user_recent_avg_7d    = excluded.user_recent_avg_7d,
+    hour_dow_ctr_28d      = excluded.hour_dow_ctr_28d,
+    post_type_ctr_14d     = excluded.post_type_ctr_14d,
+    industry              = excluded.industry,
+    created_at            = now_utc()
   ;
   get diagnostics ins_future = row_count;
 
@@ -882,10 +939,12 @@ begin
   return json_build_object(
     'inserted_or_updated_historic', ins_hist,
     'inserted_or_updated_future',  ins_future,
-    'history_days', p_history_days,
-    'future_days', p_future_days
+    'history_days',                p_history_days,
+    'future_days',                 p_future_days
   );
-end $$;
+end;
+$$;
+
 
 
 -- 1) Ensure the bucket exists and is public
@@ -1065,7 +1124,7 @@ $$;
 
 create or replace function public.get_time_segment_recommendations(
   p_platform      platform_enum default null,
-  p_horizon_days  int             default 7
+  p_horizon_days  int           default 7
 )
 returns table (
   platform      platform_enum,
@@ -1096,20 +1155,71 @@ as $$
       and f.timeslot >= date_trunc('hour', now())
       and f.timeslot <  date_trunc('hour', now() + make_interval(days => p_horizon_days))
   ),
+  brand as (
+    select
+      bp.user_id,
+      bp.industry
+    from public.brand_profiles bp
+    where bp.user_id = auth.uid()
+  ),
+  -- Combine per-timeslot label, recent avg, and GLOBAL + INDUSTRY priors
   scored as (
     select
-      user_id,
-      platform,
-      timeslot,
-      dow,
-      hour,
-      segment_id,
+      b.user_id,
+      b.platform,
+      b.timeslot,
+      b.dow,
+      b.hour,
+      b.segment_id,
       case
-        when label_engagement is not null then label_engagement
-        when user_recent_avg_7d is not null then user_recent_avg_7d
-        else 0
+        when b.label_engagement   is not null then b.label_engagement
+        when b.user_recent_avg_7d is not null then b.user_recent_avg_7d
+        else coalesce(
+          ghp_ind.prior_score,   -- industry-specific prior
+          ghp_global.prior_score, -- global prior
+          0
+        )
       end as predicted_avg
-    from base
+    from base b
+    left join brand br
+      on br.user_id = b.user_id
+    -- industry-specific priors
+    left join public.global_hourly_priors ghp_ind
+      on ghp_ind.platform = b.platform
+     and ghp_ind.dow      = b.dow
+     and ghp_ind.hour     = b.hour
+     and ghp_ind.industry = coalesce(br.industry, 'other'::industry_enum)
+    -- global fallbacks (industry is null)
+    left join public.global_hourly_priors ghp_global
+      on ghp_global.platform = b.platform
+     and ghp_global.dow      = b.dow
+     and ghp_global.hour     = b.hour
+     and ghp_global.industry is null
+  ),
+  -- Mix in bandit parameters (alpha/beta) to get a hybrid score
+  scored_with_bandit as (
+    select
+      s.user_id,
+      s.platform,
+      s.timeslot,
+      s.dow,
+      s.hour,
+      s.segment_id,
+      s.predicted_avg,
+      case
+        when bp2.context_id is null
+             or (bp2.alpha + bp2.beta) <= 0
+          then s.predicted_avg
+        else
+          0.7 * s.predicted_avg
+          + 0.3 * (bp2.alpha::numeric / (bp2.alpha + bp2.beta))
+      end as final_score
+    from scored s
+    left join public.v_bandit_params bp2
+      on bp2.user_id    = s.user_id
+     and bp2.platform   = s.platform
+     and bp2.weekday    = s.dow
+     and bp2.hour_block = s.hour
   ),
   seg as (
     select
@@ -1120,17 +1230,415 @@ as $$
     where user_id = auth.uid()
   )
   select
-    s.platform,
-    s.timeslot,
-    s.dow,
-    s.hour,
-    s.predicted_avg,
-    s.segment_id,
+    b.platform,
+    b.timeslot,
+    b.dow,
+    b.hour,
+    b.final_score as predicted_avg,
+    b.segment_id,
     coalesce(seg.segment_name, null) as segment_name
-  from scored s
+  from scored_with_bandit b
   left join seg
-    on seg.user_id = s.user_id
-   and seg.segment_id = s.segment_id
-  order by s.predicted_avg desc nulls last, s.timeslot
+    on seg.user_id   = b.user_id
+   and seg.segment_id = b.segment_id
+  order by b.final_score desc nulls last, b.timeslot
   limit 20;
 $$;
+
+
+create table if not exists public.global_hourly_priors (
+  id bigserial primary key,
+  platform platform_enum not null,
+  dow int not null check (dow between 0 and 6),
+  hour int not null check (hour between 0 and 23),
+  prior_score numeric not null, -- 0–1, roughly like label_engagement
+  industry industry_enum not null default 'other',
+  constraint uq_global_hour unique (platform, industry, dow, hour);
+);
+
+with
+-- hours 0–23 and days 0–6
+hours as (
+  select generate_series(0, 23) as hour
+),
+days as (
+  select generate_series(0, 6) as dow
+),
+
+-- Base hourly pattern (before industry)
+-- dow: 0 = Sunday, 6 = Saturday
+base_pattern as (
+  select
+    d.dow      as base_dow,
+    h.hour     as base_hour,
+    (
+      -- 1. Raw hour-of-day shape (global + PH trend-ish)
+      case
+        -- Very low: 0–4 AM
+        when h.hour between 0 and 4 then 0.10
+
+        -- Early: 5–7 AM
+        when h.hour between 5 and 7 then 0.20
+
+        -- Workday: 8–11 AM
+        when h.hour between 8 and 11 then 0.35
+
+        -- Lunch spike: 12–13
+        when h.hour between 12 and 13 then 0.55
+
+        -- Afternoon dip: 14–16
+        when h.hour between 14 and 16 then 0.35
+
+        -- Early evening ramp: 17–18
+        when h.hour between 17 and 18 then 0.55
+
+        -- Prime time: 19–21
+        when h.hour between 19 and 21 then 0.80
+
+        -- Late evening: 22–23
+        when h.hour between 22 and 23 then 0.50
+
+        else 0.30
+      end
+    )
+    *
+    (
+      -- 2. Day-of-week modifier
+      case
+        when d.dow in (0, 6) then 1.10  -- Sun / Sat
+        when d.dow = 5 then 1.05        -- Fri
+        else 1.00                       -- Mon–Thu
+      end
+    ) as base_score
+  from days d
+  cross join hours h
+),
+
+-- Enumerate industries from your existing enum
+industries as (
+  select unnest(array[
+    'restaurant'::industry_enum,
+    'cafe'::industry_enum,
+    'clinic'::industry_enum,
+    'ecommerce'::industry_enum,
+    'coach_consultant'::industry_enum,
+    'content_creator'::industry_enum,
+    'agency'::industry_enum,
+    'education'::industry_enum,
+    'other'::industry_enum
+  ]) as industry
+),
+
+-- Combine base pattern with industry-specific multipliers
+scored as (
+  select
+    'facebook'::platform_enum as platform,
+    b.base_dow  as dow,
+    b.base_hour as hour,
+    i.industry,
+
+    case
+      -- RESTAURANT: strong lunch & dinner, esp. Fri–Sun evenings
+      when i.industry = 'restaurant' then
+        b.base_score *
+        (
+          case
+            when b.base_hour between 11 and 14 then 1.20   -- lunch
+            when b.base_hour between 18 and 21 then 1.25   -- dinner / primetime
+            when b.base_dow in (5, 6, 0) and b.base_hour between 18 and 22 then 1.30
+            else 0.95
+          end
+        )
+
+      -- CAFE: mornings + weekends
+      when i.industry = 'cafe' then
+        b.base_score *
+        (
+          case
+            when b.base_hour between 7 and 10 then 1.25
+            when b.base_dow in (6, 0) and b.base_hour between 9 and 17 then 1.20
+            else 0.95
+          end
+        )
+
+      -- CLINIC: weekday daytime + early evening
+      when i.industry = 'clinic' then
+        b.base_score *
+        (
+          case
+            when b.base_dow between 1 and 5 and b.base_hour between 9 and 18 then 1.20
+            when b.base_dow in (6, 0) and b.base_hour between 10 and 15 then 1.10
+            else 0.90
+          end
+        )
+
+      -- ECOMMERCE: late evening + weekends
+      when i.industry = 'ecommerce' then
+        b.base_score *
+        (
+          case
+            when b.base_hour between 20 and 23 then 1.25
+            when b.base_dow in (5, 6, 0) and b.base_hour between 14 and 23 then 1.20
+            else 0.95
+          end
+        )
+
+      -- COACH / CONSULTANT: weekday noon + evening, Sun PM
+      when i.industry = 'coach_consultant' then
+        b.base_score *
+        (
+          case
+            when b.base_dow between 1 and 4 and b.base_hour between 12 and 14 then 1.20
+            when b.base_dow between 1 and 4 and b.base_hour between 19 and 21 then 1.20
+            when b.base_dow = 0 and b.base_hour between 18 and 21 then 1.25
+            else 0.95
+          end
+        )
+
+      -- CONTENT CREATOR: evenings, late nights, weekends
+      when i.industry = 'content_creator' then
+        b.base_score *
+        (
+          case
+            when b.base_hour between 19 and 23 then 1.25
+            when b.base_hour between 0 and 1 then 1.15
+            when b.base_dow in (5, 6, 0) and b.base_hour between 14 and 23 then 1.20
+            else 0.95
+          end
+        )
+
+      -- AGENCY: B2B-ish, strong weekday hours
+      when i.industry = 'agency' then
+        b.base_score *
+        (
+          case
+            when b.base_dow between 1 and 5 and b.base_hour between 9 and 18 then 1.20
+            else 0.90
+          end
+        )
+
+      -- EDUCATION: weekday daytime + early evening, Sun PM
+      when i.industry = 'education' then
+        b.base_score *
+        (
+          case
+            when b.base_dow between 1 and 5 and b.base_hour between 9 and 19 then 1.20
+            when b.base_dow = 0 and b.base_hour between 18 and 21 then 1.25
+            else 0.90
+          end
+        )
+
+      -- OTHER: just base
+      else
+        b.base_score * 1.00
+    end as raw_prior_score
+  from base_pattern b
+  cross join industries i
+),
+
+-- Clamp to [0.05, 0.95]
+final_scores as (
+  select
+    platform,
+    dow,
+    hour,
+    industry,
+    greatest(0.05, least(0.95, raw_prior_score)) as prior_score
+  from scored
+)
+
+insert into public.global_hourly_priors (
+  platform,
+  dow,
+  hour,
+  prior_score,
+  industry
+)
+select
+  platform,
+  dow,
+  hour,
+  prior_score,
+  industry
+from final_scores
+on conflict (platform, industry, dow, hour)
+do update
+set prior_score = excluded.prior_score;
+
+
+create or replace function public.upsert_bandit_context(
+  p_user_id uuid,
+  p_platform platform_enum,
+  p_weekday int,
+  p_hour_block int
+) returns bigint
+language plpgsql
+security definer
+as $$
+declare
+  ctx_id bigint;
+begin
+  insert into public.bandit_contexts (
+    user_id, platform, weekday, hour_block
+  ) values (
+    p_user_id, p_platform, p_weekday, p_hour_block
+  )
+  on conflict (user_id, platform, weekday, hour_block)
+  where segment_id is null and post_type is null
+  do update set updated_at = now_utc()
+  returning id into ctx_id;
+
+  return ctx_id;
+end;
+$$;
+
+create or replace function public.record_bandit_reward_for_post(p_scheduled_post_id uuid)
+returns void
+language plpgsql
+security definer
+as $$
+declare
+  v_user_id   uuid;
+  v_platform  platform_enum;
+  v_posted_at timestamptz;
+  v_weekday   int;
+  v_hour      int;
+  v_ctx_id    bigint;
+  v_reward    numeric;
+begin
+  select user_id, platform, posted_at
+  into v_user_id, v_platform, v_posted_at
+  from public.scheduled_posts
+  where id = p_scheduled_post_id;
+
+  if v_posted_at is null then
+    return;
+  end if;
+
+  v_weekday := extract(dow from v_posted_at)::int;
+  v_hour    := extract(hour from v_posted_at)::int;
+
+  v_ctx_id := public.upsert_bandit_context(v_user_id, v_platform, v_weekday, v_hour);
+
+  -- compute reward from features_engagement_timeslots for that timeslot
+  select label_engagement
+  into v_reward
+  from public.features_engagement_timeslots
+  where user_id = v_user_id
+    and platform = v_platform
+    and timeslot = date_trunc('hour', v_posted_at)
+  limit 1;
+
+  if v_reward is null then
+    return;
+  end if;
+
+  insert into public.bandit_rewards (user_id, context_id, scheduled_post_id, reward)
+  values (v_user_id, v_ctx_id, p_scheduled_post_id, v_reward)
+  on conflict (scheduled_post_id) do nothing;  -- idempotent
+end;
+$$;
+
+
+-- Trigger fn: record bandit reward when a schedule transitions to 'posted'
+create or replace function public.trg_sched_posts_record_bandit()
+returns trigger
+language plpgsql
+security definer
+as $$
+begin
+  -- Only fire on UPDATE → posted (avoid re-running on no-op updates)
+  if TG_OP = 'UPDATE'
+     and new.status = 'posted'
+     and (old.status is distinct from new.status)
+  then
+    -- Assumes posted_at is set in the same update that sets status='posted'
+    perform public.record_bandit_reward_for_post(new.id);
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_sched_posts_record_bandit on public.scheduled_posts;
+
+create trigger trg_sched_posts_record_bandit
+after update of status on public.scheduled_posts
+for each row
+execute function public.trg_sched_posts_record_bandit();
+
+create unique index if not exists uq_bandit_rewards_sched
+  on public.bandit_rewards(scheduled_post_id)
+  where scheduled_post_id is not null;
+
+create or replace view public.v_bandit_params as
+select
+  c.id as context_id,
+  c.user_id,
+  c.platform,
+  c.weekday,
+  c.hour_block,
+  c.prior_success + coalesce(sum(case when r.reward > 0.5 then 1 else 0 end), 0) as alpha,
+  c.prior_failure + coalesce(sum(case when r.reward <= 0.5 then 1 else 0 end), 0) as beta
+from public.bandit_contexts c
+left join public.bandit_rewards r
+  on r.context_id = c.id
+group by c.id, c.user_id, c.platform, c.weekday, c.hour_block,
+         c.prior_success, c.prior_failure;
+
+do $$ begin
+  create type industry_enum as enum (
+    'restaurant',
+    'cafe',
+    'clinic',
+    'ecommerce',
+    'coach_consultant',
+    'content_creator',
+    'agency',
+    'education',
+    'other'
+  );
+exception when duplicate_object then null; end $$;
+create table if not exists public.brand_profiles (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  industry industry_enum not null default 'other',
+  brand_name text,
+  goals jsonb,             -- e.g. {"awareness": 0.4, "engagement": 0.4, "sales": 0.2}
+  target_audience jsonb,   -- free-form description / segments
+  created_at timestamptz not null default now_utc(),
+  updated_at timestamptz not null default now_utc()
+);
+
+alter table public.brand_profiles enable row level security;
+
+do $$ begin
+  create policy brand_profiles_user_rw on public.brand_profiles
+    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;
+
+drop trigger if exists trg_brand_profiles_updated on public.brand_profiles;
+create trigger trg_brand_profiles_updated
+before update on public.brand_profiles
+for each row execute function set_updated_at();
+
+create table if not exists public.content_priors (
+  id bigserial primary key,
+  industry industry_enum,
+  content_type post_type_enum,         -- 'image','video','reel','story','carousel','link'
+  objective text,                      -- 'awareness','engagement','conversion' (or enum later)
+  angle text,                          -- 'how_to','testimonial','promo','faq',...
+  prior_multiplier numeric not null,   -- e.g. 1.2 means +20% vs baseline
+  constraint uq_content_prior unique (industry, content_type, objective, angle)
+);
+
+create table if not exists public.external_posts (
+  id bigserial primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform platform_enum not null,
+  object_id text not null, -- Facebook post ID
+  page_id text not null,   -- FB page id
+  caption text,
+  content_type text,       -- e.g. "photo", "video", "reel", "link"
+  created_at timestamptz not null,
+  constraint uq_external_post unique (user_id, platform, object_id)
+);
