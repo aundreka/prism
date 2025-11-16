@@ -28,7 +28,6 @@ export default function PostsScreen() {
   const [sched, setSched] = useState<ScheduledRow[]>([]);
   const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
 
-  // filters
   const [activePlatforms, setActivePlatforms] = useState<PlatformEnum[]>(["instagram","facebook"]);
   const [activeStatuses, setActiveStatuses] = useState<PostStatusEnum[]>(["scheduled","posting","posted","failed","canceled","draft"]);
 
@@ -254,7 +253,7 @@ export default function PostsScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex:1, backgroundColor: BG, paddingHorizontal:16, paddingTop:18 },
+  container: { flex:1, backgroundColor: BG, paddingHorizontal:16, paddingTop:100 },
   title: { fontSize:22, fontWeight:"800", color:TEXT, marginBottom:8 },
 
   filterCard: { backgroundColor:"#fff", borderRadius:14, borderWidth:1, borderColor:BORDER, padding:12, marginBottom:10 },

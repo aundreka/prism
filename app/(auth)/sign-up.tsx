@@ -16,7 +16,6 @@ import {
 // e.g., "prism://auth/callback"
 const EMAIL_REDIRECT_TO =
   Platform.select({
-    web: `${window.location.origin}/auth/callback`,
     default: 'prism://auth/callback',
   }) || 'prism://auth/callback';
 

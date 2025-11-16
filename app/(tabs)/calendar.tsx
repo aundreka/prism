@@ -8,13 +8,13 @@ import {
   Text,
   TouchableOpacity,
   View,
-  Dimensions,
 } from "react-native";
 import { FontAwesome } from "@expo/vector-icons";
 import { supabase } from "@/lib/supabase";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useHeaderHeight } from "@react-navigation/elements";
+import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
 
 type PlatformEnum = "facebook" | "instagram";
 type PostStatusEnum = "draft" | "scheduled" | "posting" | "posted" | "failed" | "canceled";
@@ -41,17 +41,34 @@ const BORDER = "#E5E7EB";
 const SOFT = "#EEF2F7";
 const TINT = "#111827";
 
-function zeroPad(n: number) { return n < 10 ? `0${n}` : `${n}`; }
-function ymd(d: Date) { return `${d.getFullYear()}-${zeroPad(d.getMonth() + 1)}-${zeroPad(d.getDate())}`; }
-function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
-function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
-function addMonths(d: Date, delta: number) { return new Date(d.getFullYear(), d.getMonth() + delta, 1); }
-function daysInMonth(d: Date) { return endOfMonth(d).getDate(); }
-function trunc(s: string, n: number) { const t = s.trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; }
+function zeroPad(n: number) {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+function ymd(d: Date) {
+  return `${d.getFullYear()}-${zeroPad(d.getMonth() + 1)}-${zeroPad(d.getDate())}`;
+}
+function startOfMonth(d: Date) {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+function endOfMonth(d: Date) {
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0);
+}
+function addMonths(d: Date, delta: number) {
+  return new Date(d.getFullYear(), d.getMonth() + delta, 1);
+}
+function daysInMonth(d: Date) {
+  return endOfMonth(d).getDate();
+}
+function trunc(s: string, n: number) {
+  const t = s.trim();
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
 
 export default function CalendarScreen() {
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
+  const tabBarHeight = useBottomTabBarHeight();
+
   const [cursor, setCursor] = useState<Date>(startOfMonth(new Date()));
   const [selected, setSelected] = useState<string>(ymd(new Date()));
   const [loading, setLoading] = useState(true);
@@ -61,7 +78,10 @@ export default function CalendarScreen() {
     (async () => {
       const { data } = await supabase.auth.getUser();
       const user = data?.user;
-      if (!user) { Alert.alert("Sign in required", "Please sign in."); return; }
+      if (!user) {
+        Alert.alert("Sign in required", "Please sign in.");
+        return;
+      }
 
       setLoading(true);
       try {
@@ -69,11 +89,17 @@ export default function CalendarScreen() {
         const max = addMonths(startOfMonth(new Date()), +7);
         const { data: sched, error } = await supabase
           .from("scheduled_posts")
-          .select("id,user_id,platform,target_id,post_id,caption,post_type,status,scheduled_at,posted_at,permalink,error_message")
+          .select(
+            "id,user_id,platform,target_id,post_id,caption,post_type,status,scheduled_at,posted_at,permalink,error_message"
+          )
           .eq("user_id", user.id)
           .gte("scheduled_at", min.toISOString())
-          .lte("scheduled_at", new Date(max.getFullYear(), max.getMonth(), 0, 23, 59, 59).toISOString())
+          .lte(
+            "scheduled_at",
+            new Date(max.getFullYear(), max.getMonth(), 0, 23, 59, 59).toISOString()
+          )
           .order("scheduled_at", { ascending: true });
+
         if (error) throw error;
         setRows((sched || []) as any);
       } catch (e: any) {
@@ -104,7 +130,10 @@ export default function CalendarScreen() {
   const firstWeekday = (monthStart.getDay() + 6) % 7; // Mon start
   const totalDays = daysInMonth(cursor);
   const cells: Array<{ date: Date | null; key: string }> = [];
-  for (let i = 0; i < firstWeekday; i++) cells.push({ date: null, key: `b-${i}` });
+
+  for (let i = 0; i < firstWeekday; i++) {
+    cells.push({ date: null, key: `b-${i}` });
+  }
   for (let d = 1; d <= totalDays; d++) {
     const dayDate = new Date(cursor.getFullYear(), cursor.getMonth(), d);
     cells.push({ date: dayDate, key: ymd(dayDate) });
@@ -114,17 +143,19 @@ export default function CalendarScreen() {
 
   const todayKey = ymd(new Date());
 
-  // Sizing to make grid fill most of screen
-  const screenW = Dimensions.get("window").width;
-  const horizontalPad = 16 * 2; // container padding
-  const cellW = (screenW - horizontalPad - 1) / 7; // −1 to avoid wrap from borders
-  const cellH = cellW * 1.15;                        // a bit taller like the screenshot
-  const rowsCount = Math.ceil(cells.length / 7);     // 5 or 6
-  const gridHeight = rowsCount * cellH;
-
   if (loading) {
     return (
-      <View style={[styles.container, { paddingTop: headerHeight + insets.top + 8, alignItems: "center", justifyContent: "center" }]}>
+      <View
+        style={[
+          styles.container,
+          {
+            paddingTop: headerHeight + insets.top + 8,
+            paddingBottom: insets.bottom + tabBarHeight + 12,
+            alignItems: "center",
+            justifyContent: "center",
+          },
+        ]}
+      >
         <ActivityIndicator />
         <Text style={{ color: MUTED, marginTop: 8 }}>Loading calendar…</Text>
       </View>
@@ -132,7 +163,15 @@ export default function CalendarScreen() {
   }
 
   return (
-    <View style={[styles.container, { paddingTop: headerHeight + insets.top + 8 }]}>
+    <View
+      style={[
+        styles.container,
+        {
+          paddingTop: headerHeight + insets.top + 8,
+          paddingBottom: insets.bottom + tabBarHeight + 12,
+        },
+      ]}
+    >
       {/* Month header */}
       <View style={styles.header}>
         <TouchableOpacity
@@ -164,57 +203,70 @@ export default function CalendarScreen() {
       <View style={[styles.card, { flex: 1 }]}>
         {/* Week headings */}
         <View style={styles.weekRow}>
-          {["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map((w) => (
-            <Text key={w} style={styles.weekLabel}>{w}</Text>
+          {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((w) => (
+            <Text key={w} style={styles.weekLabel}>
+              {w}
+            </Text>
           ))}
         </View>
 
-        {/* Grid fills most of the screen */}
-        <View style={[styles.grid, { height: gridHeight }]}>
-          {cells.map((c, idx) => {
+        {/* Grid */}
+        <View style={styles.grid}>
+          {cells.map((c) => {
             if (!c.date) {
-              return <View key={c.key} style={[styles.cellBlank, { width: cellW, height: cellH }]} />;
+              return <View key={c.key} style={styles.cellBlank} />;
             }
+
             const key = ymd(c.date);
             const list = byDate.get(key) || [];
             const isToday = key === todayKey;
             const isSelected = key === selected;
 
-            const dueCount = list.filter((r) => r.status === "scheduled" || r.status === "posting").length;
-            const pastCount = list.filter((r) => ["posted","failed","canceled"].includes(r.status)).length;
+            const dueCount = list.filter(
+              (r) => r.status === "scheduled" || r.status === "posting"
+            ).length;
+            const pastCount = list.filter((r) =>
+              ["posted", "failed", "canceled"].includes(r.status)
+            ).length;
 
-            const firstCaption = list.find((r) => (r.caption || "").trim().length > 0)?.caption || "";
+            const firstCaption =
+              list.find((r) => (r.caption || "").trim().length > 0)?.caption || "";
 
             return (
               <TouchableOpacity
                 key={c.key}
                 onPress={() => setSelected(key)}
-                style={[styles.cell, { width: cellW, height: cellH }]}
+                style={styles.cell}
                 activeOpacity={0.8}
               >
-                <View style={[
-                  styles.dayBubble,
-                  isToday && !isSelected && styles.dayBubbleToday,
-                  isSelected && styles.dayBubbleSelected,
-                ]}>
-                  <Text style={[
-                    styles.dayNum,
-                    isToday && !isSelected && styles.dayNumToday,
-                    isSelected && styles.dayNumSelected,
-                  ]}>
+                <View
+                  style={[
+                    styles.dayBubble,
+                    isToday && !isSelected && styles.dayBubbleToday,
+                    isSelected && styles.dayBubbleSelected,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.dayNum,
+                      isToday && !isSelected && styles.dayNumToday,
+                      isSelected && styles.dayNumSelected,
+                    ]}
+                  >
                     {c.date.getDate()}
                   </Text>
                 </View>
 
                 <View style={styles.dotRow}>
-                  {dueCount > 0 && <View style={[styles.dot,{ backgroundColor:"#22C55E"}]} />}
-                  {pastCount > 0 && <View style={[styles.dot,{ backgroundColor:"#9CA3AF"}]} />}
+                  {dueCount > 0 && <View style={[styles.dot, { backgroundColor: "#22C55E" }]} />}
+                  {pastCount > 0 && <View style={[styles.dot, { backgroundColor: "#9CA3AF" }]} />}
                 </View>
 
-                {/* Show a small caption pill if there is one (like “Code Posi…”) */}
                 {firstCaption ? (
                   <View style={styles.captionPill}>
-                    <Text numberOfLines={1} style={styles.captionPillText}>{trunc(firstCaption, 14)}</Text>
+                    <Text numberOfLines={1} style={styles.captionPillText}>
+                      {trunc(firstCaption, 14)}
+                    </Text>
                   </View>
                 ) : null}
               </TouchableOpacity>
@@ -222,11 +274,15 @@ export default function CalendarScreen() {
           })}
         </View>
 
-        {/* Day details (no month-jump footer) */}
+        {/* Day details */}
         <View style={styles.bottomSheet}>
           <View style={styles.bottomHeader}>
             <Text style={styles.bottomTitle}>
-              {new Date(selected).toLocaleDateString(undefined,{ month:"short", day:"numeric", year:"numeric" })}
+              {new Date(selected).toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+                year: "numeric",
+              })}
             </Text>
             <Text style={styles.countPill}>{selectedList.length} items</Text>
           </View>
@@ -239,22 +295,44 @@ export default function CalendarScreen() {
               keyExtractor={(i) => i.id}
               ItemSeparatorComponent={() => <View style={{ height: 6 }} />}
               renderItem={({ item }) => {
-                const time = item.scheduled_at ? new Date(item.scheduled_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
+                const time = item.scheduled_at
+                  ? new Date(item.scheduled_at).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })
+                  : "—";
                 const isDue = item.status === "scheduled" || item.status === "posting";
-                const dotColor = isDue ? "#22C55E" : item.status === "posted" ? "#111827" : "#9CA3AF";
-                const icon = item.platform === "instagram"
-                  ? <FontAwesome name="instagram" size={16} color="#C13584" />
-                  : <FontAwesome name="facebook-square" size={16} color="#1877F2" />;
+                const dotColor = isDue
+                  ? "#22C55E"
+                  : item.status === "posted"
+                  ? "#111827"
+                  : "#9CA3AF";
+                const icon =
+                  item.platform === "instagram" ? (
+                    <FontAwesome name="instagram" size={16} color="#C13584" />
+                  ) : (
+                    <FontAwesome name="facebook-square" size={16} color="#1877F2" />
+                  );
 
                 return (
-                  <TouchableOpacity onPress={() => item.post_id && router.push(`/post/${item.post_id}`)} activeOpacity={0.8} style={styles.itemRow}>
+                  <TouchableOpacity
+                    onPress={() => item.post_id && router.push(`/post/${item.post_id}`)}
+                    activeOpacity={0.8}
+                    style={styles.itemRow}
+                  >
                     <View style={[styles.statusDot, { backgroundColor: dotColor }]} />
                     <View style={{ marginHorizontal: 8 }}>{icon}</View>
                     <View style={{ flex: 1 }}>
-                      <Text numberOfLines={2} style={styles.itemCaption}>{item.caption || "(no caption)"}</Text>
-                      <Text style={styles.itemMeta}>{time} • {item.status.toUpperCase()}</Text>
+                      <Text numberOfLines={2} style={styles.itemCaption}>
+                        {item.caption || "(no caption)"}
+                      </Text>
+                      <Text style={styles.itemMeta}>
+                        {time} • {item.status.toUpperCase()}
+                      </Text>
                     </View>
-                    {item.permalink ? <FontAwesome name="external-link" size={16} color={MUTED} /> : null}
+                    {item.permalink ? (
+                      <FontAwesome name="external-link" size={16} color={MUTED} />
+                    ) : null}
                   </TouchableOpacity>
                 );
               }}
@@ -273,7 +351,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 10,
+    marginBottom: 0,
   },
   navBtn: {
     paddingVertical: 8,
@@ -303,19 +381,30 @@ const styles = StyleSheet.create({
     borderBottomColor: SOFT,
     backgroundColor: "#fff",
   },
-  weekLabel: { width: `${100/7}%`, textAlign: "center", color: MUTED, fontSize: 12, fontWeight: "700" },
+  weekLabel: {
+    width: `${100 / 7}%`,
+    textAlign: "center",
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "700",
+  },
 
   grid: {
     backgroundColor: "#fff",
     flexWrap: "wrap",
     flexDirection: "row",
   },
+
   cellBlank: {
+    width: `${100 / 7}%`,
+    aspectRatio: 0.87,
     borderRightWidth: 1,
     borderTopWidth: 1,
     borderColor: SOFT,
   },
   cell: {
+    width: `${100 / 7}%`,
+    aspectRatio: 0.87,
     borderRightWidth: 1,
     borderTopWidth: 1,
     borderColor: SOFT,
@@ -339,7 +428,6 @@ const styles = StyleSheet.create({
   dotRow: { flexDirection: "row", gap: 4, marginTop: 6 },
   dot: { width: 6, height: 6, borderRadius: 3 },
 
-  // small badge for first caption
   captionPill: {
     position: "absolute",
     right: 4,
@@ -357,7 +445,7 @@ const styles = StyleSheet.create({
     borderTopColor: SOFT,
     paddingHorizontal: 12,
     paddingTop: 10,
-    paddingBottom: 12, // compact; no jump-to-month
+    paddingBottom: 12,
     backgroundColor: "#fff",
     flexGrow: 1,
     minHeight: 120,

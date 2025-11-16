@@ -16,6 +16,8 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { useHeaderHeight } from "@react-navigation/elements"; // ⬅️ NEW
+import { useSafeAreaInsets } from "react-native-safe-area-context"; // ⬅️ NEW
 
 // 🔔 Push helpers — make sure these names match your src/utils/push.ts exports
 // Suggested API: ensurePushReady(): Promise<void>, notify(opts: { title: string; body?: string; data?: any })
@@ -99,6 +101,9 @@ export default function ProfileScreen() {
 
   const [displayName, setDisplayName] = useState<string | null>(null);
   const [email, setEmail] = useState<string | null>(null);
+
+  const headerHeight = useHeaderHeight();          // ⬅️ NEW
+  const insets = useSafeAreaInsets();              // ⬅️ NEW
 
   useEffect(() => {
     (async () => {
@@ -244,7 +249,10 @@ export default function ProfileScreen() {
   return (
     <ScrollView
       style={styles.container}
-      contentContainerStyle={styles.content}
+      contentContainerStyle={[
+        styles.content,
+        { paddingTop: headerHeight }, // ⬅️ NEW: safe space for header
+      ]}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
     >
       {/* ---------- HEADER ---------- */}
@@ -391,7 +399,7 @@ const CARD_BG = "#FFFFFF";
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
-  content: { paddingBottom: 120 },
+  content: { paddingBottom: 0 }, // top padding added dynamically
   hero: {
     backgroundColor: "#111827",
     paddingTop: 72,

@@ -43,8 +43,8 @@ const BORDER = "#E5E7EB";
 const TINT = "#111827";
 
 // header/footer spacers (safe padding so UI never sits under bars)
-const HEADER_SPACER = 72;  // room for header
-const FOOTER_SPACER = 120; // room for tab bar / action buttons
+const HEADER_SPACER = 140;  // room for header
+const FOOTER_SPACER = 170; // room for tab bar / action buttons
 
 function zeroPad(n: number) { return n < 10 ? `0${n}` : `${n}`; }
 function formatDateTime(d: Date) {

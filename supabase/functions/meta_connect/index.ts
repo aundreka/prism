@@ -16,7 +16,7 @@ serve(async (req) => {
 
   const callback = `${Deno.env.get("EDGE_BASE_URL")}/meta_oauth_callback`;
   const perms = [
-    "pages_show_list","pages_manage_posts","pages_read_engagement",
+    "pages_show_list","pages_manage_posts","pages_manage_engagement", "read_insights", "pages_read_user_content",
     "instagram_basic","instagram_content_publish","instagram_manage_insights"
   ].join(",");
 

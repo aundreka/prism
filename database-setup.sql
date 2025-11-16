@@ -1038,3 +1038,99 @@ do $$ begin
   create policy devices_user_rw on public.user_devices
     for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 exception when duplicate_object then null; end $$;
+
+create or replace function public.sp_insights_candidate_posts(p_since timestamptz)
+returns table (
+  id uuid,
+  user_id uuid,
+  platform platform_enum,
+  api_post_id text,
+  posted_at timestamptz
+)
+language sql
+security definer
+set search_path = public
+as $$
+  select
+    id,
+    user_id,
+    platform,
+    api_post_id,
+    coalesce(posted_at, scheduled_at, created_at) as posted_at
+  from public.scheduled_posts
+  where status = 'posted'
+    and coalesce(posted_at, scheduled_at, created_at) >= p_since
+    and api_post_id is not null;
+$$;
+
+create or replace function public.get_time_segment_recommendations(
+  p_platform      platform_enum default null,
+  p_horizon_days  int             default 7
+)
+returns table (
+  platform      platform_enum,
+  timeslot      timestamptz,
+  dow           int,
+  hour          int,
+  predicted_avg numeric,
+  segment_id    int,
+  segment_name  text
+)
+language sql
+security definer
+set search_path = public
+as $$
+  with base as (
+    select
+      f.user_id,
+      f.platform,
+      f.timeslot,
+      extract(dow  from f.timeslot)::int  as dow,
+      extract(hour from f.timeslot)::int  as hour,
+      f.label_engagement,
+      f.user_recent_avg_7d,
+      f.audience_segment_id               as segment_id
+    from public.features_engagement_timeslots f
+    where f.user_id = auth.uid()
+      and (p_platform is null or f.platform = p_platform)
+      and f.timeslot >= date_trunc('hour', now())
+      and f.timeslot <  date_trunc('hour', now() + make_interval(days => p_horizon_days))
+  ),
+  scored as (
+    select
+      user_id,
+      platform,
+      timeslot,
+      dow,
+      hour,
+      segment_id,
+      case
+        when label_engagement is not null then label_engagement
+        when user_recent_avg_7d is not null then user_recent_avg_7d
+        else 0
+      end as predicted_avg
+    from base
+  ),
+  seg as (
+    select
+      user_id,
+      segment_id,
+      (summary ->> 'name')::text as segment_name
+    from public.audience_segments
+    where user_id = auth.uid()
+  )
+  select
+    s.platform,
+    s.timeslot,
+    s.dow,
+    s.hour,
+    s.predicted_avg,
+    s.segment_id,
+    coalesce(seg.segment_name, null) as segment_name
+  from scored s
+  left join seg
+    on seg.user_id = s.user_id
+   and seg.segment_id = s.segment_id
+  order by s.predicted_avg desc nulls last, s.timeslot
+  limit 20;
+$$;
