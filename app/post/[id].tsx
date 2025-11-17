@@ -1,7 +1,17 @@
 // app/post/[id].tsx
 import React, { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, Alert, Image, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useLocalSearchParams } from "expo-router";
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { useLocalSearchParams, router } from "expo-router";
+import * as Linking from "expo-linking";
 import { FontAwesome } from "@expo/vector-icons";
 import { supabase } from "@/lib/supabase";
 import { Video } from "expo-av";
@@ -48,6 +58,8 @@ export default function PostDetail() {
   const [schedules, setSchedules] = useState<Sched[]>([]);
   const [media, setMedia] = useState<MediaAsset[]>([]);
   const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
+  const [deleting, setDeleting] = useState(false);
+  const [cancelingId, setCancelingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) {
@@ -113,13 +125,29 @@ export default function PostDetail() {
     })();
   }, [id]);
 
+  // --- FIXED: use per-object max, then sum across objects ---
   const analyticsRoll = useMemo(() => {
-    const map = new Map<string, number>();
+    // 1) For each object_id, keep the max snapshot per metric
+    const perObject = new Map<string, Record<string, number>>();
+
     for (const a of analytics) {
-      const k = a.metric;
-      map.set(k, (map.get(k) || 0) + Number(a.value || 0));
+      if (!a.object_id) continue;
+      if (!perObject.has(a.object_id)) perObject.set(a.object_id, {});
+      const bucket = perObject.get(a.object_id)!;
+
+      const val = Number(a.value) || 0;
+      bucket[a.metric] = Math.max(bucket[a.metric] || 0, val);
     }
-    return map;
+
+    // 2) Sum those per-object maxima into a single rollup map
+    const total = new Map<string, number>();
+    for (const bucket of perObject.values()) {
+      for (const [metric, val] of Object.entries(bucket)) {
+        total.set(metric, (total.get(metric) || 0) + val);
+      }
+    }
+
+    return total;
   }, [analytics]);
 
   // --- metrics computed from analyticsRoll ---
@@ -137,7 +165,7 @@ export default function PostDetail() {
   const engagementRate = impressions > 0 ? (engagement / impressions) * 100 : 0;
   const ctr = impressions > 0 ? (clicks / impressions) * 100 : 0;
 
-  // simple performance label (hook must be at top level, not inside condition)
+  // simple performance label
   const performanceLabel = useMemo(() => {
     if (impressions < 100 && engagementRate < 1) return "Too early to judge";
     if (engagementRate >= 6 && impressions >= 500) return "High performing";
@@ -145,6 +173,94 @@ export default function PostDetail() {
     if (engagementRate < 1 && impressions >= 300) return "Underperforming";
     return "Average";
   }, [impressions, engagementRate]);
+
+  // --- draft / schedule helpers ---
+  const hasActiveSchedule = schedules.some(
+    (s) => s.status === "scheduled" || s.status === "posting"
+  );
+  const hasPosted = schedules.some((s) => s.status === "posted");
+  const isDraftPost = !hasActiveSchedule && !hasPosted;
+
+  // --- actions ---
+  const handleDeleteDraft = () => {
+    if (!post) return;
+
+    Alert.alert(
+      "Delete draft?",
+      "This will permanently delete this draft post and any unsent schedules. This cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setDeleting(true);
+              // Clean up any schedules linked to this draft, just in case
+              const { error: es } = await supabase
+                .from("scheduled_posts")
+                .delete()
+                .eq("post_id", post.id);
+              if (es) throw es;
+
+              const { error: ep } = await supabase.from("posts").delete().eq("id", post.id);
+              if (ep) throw ep;
+
+              router.back();
+            } catch (e: any) {
+              console.error("Delete draft error:", e);
+              Alert.alert("Error", e?.message ?? "Failed to delete draft.");
+            } finally {
+              setDeleting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCancelSchedule = (schedId: string) => {
+    Alert.alert(
+      "Cancel schedule?",
+      "This will keep the post as a draft so you can reschedule it later.",
+      [
+        { text: "Keep scheduled", style: "cancel" },
+        {
+          text: "Cancel schedule",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setCancelingId(schedId);
+              const { error } = await supabase
+                .from("scheduled_posts")
+                .update({ status: "draft", scheduled_at: null })
+                .eq("id", schedId);
+              if (error) throw error;
+
+              setSchedules((prev) =>
+                prev.map((s) =>
+                  s.id === schedId ? { ...s, status: "draft", scheduled_at: null } : s
+                )
+              );
+            } catch (e: any) {
+              console.error("Cancel schedule error:", e);
+              Alert.alert("Error", e?.message ?? "Failed to cancel schedule.");
+            } finally {
+              setCancelingId(null);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleOpenPermalink = (permalink: string | null) => {
+    if (!permalink) return;
+    Linking.openURL(permalink).catch((err) => {
+      console.error("Failed to open permalink:", err);
+      Alert.alert("Error", "Could not open the Facebook post.");
+    });
+  };
 
   if (loading) {
     return (
@@ -224,6 +340,8 @@ export default function PostDetail() {
                 : s.status === "posted"
                 ? "#111827"
                 : "#9CA3AF";
+            const isCancelable = s.status === "scheduled" || s.status === "posting";
+
             return (
               <View key={s.id} style={styles.scheduleRow}>
                 <View style={[styles.dot, { backgroundColor: statusColor }]} />
@@ -235,11 +353,55 @@ export default function PostDetail() {
                     <Text style={{ color: "#B91C1C", fontSize: 12, marginTop: 2 }}>{s.error_message}</Text>
                   ) : null}
                 </View>
-                {s.permalink ? <FontAwesome name="external-link" size={14} color={MUTED} /> : null}
+
+                {/* Right-side actions: View + Cancel */}
+                <View style={{ flexDirection: "row", alignItems: "center" }}>
+                  {s.permalink ? (
+                    <TouchableOpacity
+                      onPress={() => handleOpenPermalink(s.permalink)}
+                      style={styles.viewChip}
+                    >
+                      <FontAwesome name="external-link" size={12} color="#1D4ED8" />
+                      <Text style={styles.viewChipText}>View</Text>
+                    </TouchableOpacity>
+                  ) : null}
+
+                  {isCancelable ? (
+                    <TouchableOpacity
+                      onPress={() => handleCancelSchedule(s.id)}
+                      disabled={cancelingId === s.id}
+                      style={[
+                        styles.cancelChip,
+                        cancelingId === s.id && { opacity: 0.6 },
+                      ]}
+                    >
+                      {cancelingId === s.id ? (
+                        <ActivityIndicator size="small" />
+                      ) : (
+                        <Text style={styles.cancelChipText}>Cancel</Text>
+                      )}
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
               </View>
             );
           })
         )}
+
+        {/* Delete draft button when this post has no active/posted schedules */}
+        {isDraftPost ? (
+          <TouchableOpacity
+            style={[styles.deleteButton, deleting && { opacity: 0.7 }]}
+            disabled={deleting}
+            onPress={handleDeleteDraft}
+          >
+            {deleting ? (
+              <ActivityIndicator />
+            ) : (
+              <Text style={styles.deleteButtonText}>Delete draft</Text>
+            )}
+          </TouchableOpacity>
+        ) : null}
       </View>
 
       {/* Analytics */}
@@ -358,4 +520,51 @@ const styles = StyleSheet.create({
   metric: { minWidth: 90 },
   mTitle: { color: MUTED, fontSize: 11 },
   mValue: { color: TEXT, fontWeight: "800", fontSize: 16, marginTop: 2 },
+
+  viewChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#60A5FA",
+    backgroundColor: "#EFF6FF",
+    marginLeft: 8,
+  },
+  viewChipText: {
+    color: "#1D4ED8",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
+  cancelChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#F97373",
+    marginLeft: 8,
+  },
+  cancelChipText: {
+    color: "#B91C1C",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  deleteButton: {
+    marginTop: 12,
+    paddingVertical: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#FCA5A5",
+    backgroundColor: "#FEF2F2",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  deleteButtonText: {
+    color: "#B91C1C",
+    fontWeight: "700",
+    fontSize: 13,
+  },
 });

@@ -1,10 +1,10 @@
-
+// supabase/functions/meta_publish_worker/index.ts
 import { createClient } from "https://esm.sh/@supabase/supabase-js";
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const FB_GRAPH = "https://graph.facebook.com/v21.0"; // ← bump to v21
+const FB_GRAPH = "https://graph.facebook.com/v21.0";
 
 type Sched = {
   id: string;
@@ -58,14 +58,25 @@ async function sendExpoPush(token: string, title: string, body: string) {
   });
 }
 
+type ParsedFB = {
+  ok: boolean;
+  json: any;
+  raw: string;
+};
+
 // Parse any FB response (even non-JSON)
-async function parseFB(r: Response) {
+async function parseFB(r: Response): Promise<ParsedFB> {
   const text = await r.text();
-  try { return { ok: r.ok, json: JSON.parse(text), raw: text }; }
-  catch { return { ok: r.ok, json: null as any, raw: text }; }
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // ignore JSON parse failures
+  }
+  return { ok: r.ok, json, raw: text };
 }
 
-Deno.serve(async () => {
+Deno.serve(async (_req: Request) => {
   const sb = createClient(SUPABASE_URL, SERVICE_ROLE);
 
   try {
@@ -81,11 +92,16 @@ Deno.serve(async () => {
 
     if (dueErr) {
       console.error("scheduled_posts query failed:", dueErr);
-      return j(500, { error: "select_failed", detail: String(dueErr.message || dueErr) });
+      return j(500, {
+        error: "select_failed",
+        detail: String((dueErr as any).message || dueErr),
+      });
     }
 
-    console.log("due count:", (due ?? []).length, "now:", nowIso);
-    if (!due || !due.length) return j(200, { ok: true, processed: 0 });
+    console.log("due count:", (due || []).length, "now:", nowIso);
+    if (!due || !due.length) {
+      return j(200, { ok: true, processed: 0 });
+    }
 
     for (const job of due as Sched[]) {
       // mark as posting (avoid double-run)
@@ -97,7 +113,14 @@ Deno.serve(async () => {
       if (upErr) {
         console.error("failed to mark posting:", job.id, upErr);
         // store the failure (best-effort)
-        await sb.rpc("sp_attempt_fail", { p_id: job.id, p_message: "mark_posting_failed" }).catch(() => {});
+        try {
+          await sb.rpc("sp_attempt_fail", {
+            p_id: job.id,
+            p_message: "mark_posting_failed",
+          });
+        } catch {
+          // ignore
+        }
         continue;
       }
 
@@ -109,15 +132,23 @@ Deno.serve(async () => {
           .eq("user_id", job.user_id)
           .eq("platform", "facebook");
 
-        if (cErr) throw cErr;
+        if (cErr) {
+          throw cErr;
+        }
 
         const connections = (conns || []) as Conn[];
         const conn =
           job.platform === "facebook"
-            ? connections.find(c => c.page_id && c.page_id === job.target_id)
-            : connections.find(c => c.ig_user_id && c.ig_user_id === job.target_id);
+            ? connections.find(
+                (c) => c.page_id && c.page_id === job.target_id,
+              )
+            : connections.find(
+                (c) => c.ig_user_id && c.ig_user_id === job.target_id,
+              );
 
-        if (!conn?.access_token) throw new Error("access_token_not_found");
+        if (!conn || !conn.access_token) {
+          throw new Error("access_token_not_found");
+        }
 
         // 3) gather media (ordered)
         const { data: spm, error: spmErr } = await sb
@@ -126,7 +157,9 @@ Deno.serve(async () => {
           .eq("scheduled_post_id", job.id)
           .order("position", { ascending: true });
 
-        if (spmErr) throw spmErr;
+        if (spmErr) {
+          throw spmErr;
+        }
 
         const mediaIds = (spm || []).map((r: any) => r.media_id);
         let media: Media[] = [];
@@ -135,41 +168,88 @@ Deno.serve(async () => {
             .from("media_assets")
             .select("id, public_url, mime_type, width, height, duration_ms")
             .in("id", mediaIds);
-          if (mErr) throw mErr;
-          media = assets as Media[];
+          if (mErr) {
+            throw mErr;
+          }
+          media = (assets || []) as Media[];
         }
 
         // 4) publish
-        const caption = job.caption ?? "";
+        const caption = job.caption || "";
         if (job.platform === "facebook") {
           const { apiId, permalink } = await publishToFacebook({
-            pageId: (conn.page_id as string),
+            pageId: conn.page_id as string,
             pageToken: conn.access_token,
             caption,
             media,
           });
 
-          await sb.from("scheduled_posts").update({
-            status: "posted",
-            posted_at: new Date().toISOString(),
-            api_post_id: apiId ?? null,
-            permalink: permalink ?? null,
-            error_message: null,
-          }).eq("id", job.id);
+          const { error: updateErr } = await sb
+            .from("scheduled_posts")
+            .update({
+              status: "posted",
+              posted_at: new Date().toISOString(),
+              api_post_id: apiId || null,
+              permalink: permalink || null,
+              error_message: null,
+            })
+            .eq("id", job.id);
+
+          // ⬅️ important: don't silently fail this
+          if (updateErr) {
+            throw new Error(
+              `mark_posted_failed:${(updateErr as any).message || updateErr}`,
+            );
+          }
+
+          // 🔵 NEW: record bandit reward for this post (best-effort)
+          try {
+            await sb.rpc("record_bandit_reward_for_post", {
+              p_scheduled_post_id: job.id,
+            });
+          } catch (rbErr) {
+            console.error(
+              "record_bandit_reward_for_post failed (facebook):",
+              job.id,
+              rbErr,
+            );
+          }
         } else {
           const { apiId } = await publishToInstagram({
-            igUserId: (conn.ig_user_id as string),
+            igUserId: conn.ig_user_id as string,
             pageToken: conn.access_token,
             caption,
             media,
           });
 
-          await sb.from("scheduled_posts").update({
-            status: "posted",
-            posted_at: new Date().toISOString(),
-            api_post_id: apiId ?? null,
-            error_message: null,
-          }).eq("id", job.id);
+          const { error: updateErr } = await sb
+            .from("scheduled_posts")
+            .update({
+              status: "posted",
+              posted_at: new Date().toISOString(),
+              api_post_id: apiId || null,
+              error_message: null,
+            })
+            .eq("id", job.id);
+
+          if (updateErr) {
+            throw new Error(
+              `ig_mark_posted_failed:${(updateErr as any).message || updateErr}`,
+            );
+          }
+
+          // 🔵 NEW: record bandit reward for this post (best-effort)
+          try {
+            await sb.rpc("record_bandit_reward_for_post", {
+              p_scheduled_post_id: job.id,
+            });
+          } catch (rbErr) {
+            console.error(
+              "record_bandit_reward_for_post failed (instagram):",
+              job.id,
+              rbErr,
+            );
+          }
         }
 
         // 5) push notify
@@ -180,25 +260,58 @@ Deno.serve(async () => {
           .not("expo_push_token", "is", null);
 
         for (const d of devices || []) {
-          await sendExpoPush(
-            d.expo_push_token,
-            "Post published ✅",
-            job.platform === "facebook"
-              ? "Your Facebook post has been published."
-              : "Your Instagram post has been published."
-          ).catch(() => {});
+          try {
+            await sendExpoPush(
+              (d as any).expo_push_token,
+              "Post published ✅",
+              job.platform === "facebook"
+                ? "Your Facebook post has been published."
+                : "Your Instagram post has been published.",
+            );
+          } catch {
+            // ignore push errors
+          }
         }
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
+      } catch (e) {
+        const msg =
+          e && typeof e === "object" && "message" in e
+            ? (e as any).message
+            : String(e);
         console.error("job failed:", job.id, msg);
-        await sb.rpc("sp_attempt_fail", { p_id: job.id, p_message: msg }).catch(() => {});
+
+        // 🔴 NEW: mark job as failed so it doesn't stay stuck in "posting"
+        try {
+          await sb
+            .from("scheduled_posts")
+            .update({
+              status: "failed",
+              error_message: msg,
+            })
+            .eq("id", job.id);
+        } catch (markErr) {
+          console.error("failed to mark job failed:", job.id, markErr);
+        }
+
+        // keep your existing attempts log
+        try {
+          await sb.rpc("sp_attempt_fail", {
+            p_id: job.id,
+            p_message: String(msg),
+          });
+        } catch {
+          // ignore
+        }
       }
     }
 
     return j(200, { ok: true, processed: due.length });
-  } catch (e: any) {
-    console.error("worker top-level error:", e);
-    return j(500, { error: "worker_failed", detail: String(e?.message ?? e) });
+  } catch (e) {
+    const detail =
+      e && typeof e === "object" && "message" in e
+        ? (e as any).message
+        : String(e);
+    console.error("worker top-level error:", detail);
+    return j(500, { error: "worker_failed", detail: String(detail) });
   }
 });
 
@@ -210,34 +323,55 @@ type PublishArgsFB = {
   media: Media[];
 };
 
-async function publishToFacebook({ pageId, pageToken, caption, media }: PublishArgsFB) {
-  if (!media.length) throw new Error("no_media_for_fb");
+async function publishToFacebook({
+  pageId,
+  pageToken,
+  caption,
+  media,
+}: PublishArgsFB) {
+  if (!media.length) {
+    throw new Error("no_media_for_fb");
+  }
 
-  const imgs = media.filter((m) => (m.mime_type ?? "").startsWith("image/") && m.public_url);
-  const vids = media.filter((m) => (m.mime_type ?? "").startsWith("video/") && m.public_url);
+  const imgs = media.filter(
+    (m) => (m.mime_type || "").startsWith("image/") && m.public_url,
+  );
+  const vids = media.filter(
+    (m) => (m.mime_type || "").startsWith("video/") && m.public_url,
+  );
 
   // Multi-image carousel (photos → unpublished children → /feed)
   if (imgs.length > 1 && vids.length === 0) {
     const childIds: string[] = [];
     for (const img of imgs) {
       const u = new URL(`${FB_GRAPH}/${pageId}/photos`);
-      u.searchParams.set("url", img.public_url!);
+      u.searchParams.set("url", img.public_url as string);
       u.searchParams.set("published", "false");
       u.searchParams.set("access_token", pageToken);
       const r = await fetch(u, { method: "POST" });
       const { ok, json, raw } = await parseFB(r);
-      if (!ok || !json?.id) throw new Error(`fb_child_photo_failed:${raw}`);
-      childIds.push(json.id);
+      if (!ok || !json || !json.id) {
+        throw new Error(`fb_child_photo_failed:${raw}`);
+      }
+      childIds.push(json.id as string);
     }
+
     const pf = new URL(`${FB_GRAPH}/${pageId}/feed`);
-    if (caption) pf.searchParams.set("message", caption);
-    childIds.forEach((id, i) =>
-      pf.searchParams.set(`attached_media[${i}]`, JSON.stringify({ media_fbid: id }))
-    );
+    if (caption) {
+      pf.searchParams.set("message", caption);
+    }
+    childIds.forEach((id, i) => {
+      pf.searchParams.set(
+        `attached_media[${i}]`,
+        JSON.stringify({ media_fbid: id }),
+      );
+    });
     pf.searchParams.set("access_token", pageToken);
     const pr = await fetch(pf, { method: "POST" });
     const { ok, json, raw } = await parseFB(pr);
-    if (!ok || !json?.id) throw new Error(`fb_feed_failed:${raw}`);
+    if (!ok || !json || !json.id) {
+      throw new Error(`fb_feed_failed:${raw}`);
+    }
 
     let permalink: string | undefined;
     try {
@@ -245,9 +379,14 @@ async function publishToFacebook({ pageId, pageToken, caption, media }: PublishA
       g.searchParams.set("fields", "permalink_url");
       g.searchParams.set("access_token", pageToken);
       const rr = await fetch(g);
-      const { json: jj } = await parseFB(rr);
-      permalink = jj?.permalink_url;
-    } catch {}
+      const parsed = await parseFB(rr);
+      if (parsed.json && parsed.json.permalink_url) {
+        permalink = parsed.json.permalink_url as string;
+      }
+    } catch {
+      // ignore
+    }
+
     return { apiId: json.id as string | undefined, permalink };
   }
 
@@ -255,13 +394,17 @@ async function publishToFacebook({ pageId, pageToken, caption, media }: PublishA
   if (imgs.length >= 1 && vids.length === 0) {
     const img = imgs[0];
     const u = new URL(`${FB_GRAPH}/${pageId}/photos`);
-    u.searchParams.set("url", img.public_url!);
-    if (caption) u.searchParams.set("caption", caption);
+    u.searchParams.set("url", img.public_url as string);
+    if (caption) {
+      u.searchParams.set("caption", caption);
+    }
     u.searchParams.set("published", "true");
     u.searchParams.set("access_token", pageToken);
     const r = await fetch(u, { method: "POST" });
     const { ok, json, raw } = await parseFB(r);
-    if (!ok || !json?.post_id) throw new Error(`fb_photo_failed:${raw}`);
+    if (!ok || !json || !json.post_id) {
+      throw new Error(`fb_photo_failed:${raw}`);
+    }
 
     let permalink: string | undefined;
     try {
@@ -269,21 +412,30 @@ async function publishToFacebook({ pageId, pageToken, caption, media }: PublishA
       g.searchParams.set("fields", "permalink_url");
       g.searchParams.set("access_token", pageToken);
       const rr = await fetch(g);
-      const { json: jj } = await parseFB(rr);
-      permalink = jj?.permalink_url;
-    } catch {}
+      const parsed = await parseFB(rr);
+      if (parsed.json && parsed.json.permalink_url) {
+        permalink = parsed.json.permalink_url as string;
+      }
+    } catch {
+      // ignore
+    }
+
     return { apiId: json.post_id as string | undefined, permalink };
   }
 
   // Single video
   const v = vids[0];
   const u = new URL(`${FB_GRAPH}/${pageId}/videos`);
-  u.searchParams.set("file_url", v.public_url!);
-  if (caption) u.searchParams.set("description", caption);
+  u.searchParams.set("file_url", v.public_url as string);
+  if (caption) {
+    u.searchParams.set("description", caption);
+  }
   u.searchParams.set("access_token", pageToken);
   const r = await fetch(u, { method: "POST" });
   const { ok, json, raw } = await parseFB(r);
-  if (!ok || !json?.id) throw new Error(`fb_video_failed:${raw}`);
+  if (!ok || !json || !json.id) {
+    throw new Error(`fb_video_failed:${raw}`);
+  }
 
   let permalink: string | undefined;
   try {
@@ -291,9 +443,14 @@ async function publishToFacebook({ pageId, pageToken, caption, media }: PublishA
     g.searchParams.set("fields", "permalink_url");
     g.searchParams.set("access_token", pageToken);
     const rr = await fetch(g);
-    const { json: jj } = await parseFB(rr);
-    permalink = jj?.permalink_url;
-  } catch {}
+    const parsed = await parseFB(rr);
+    if (parsed.json && parsed.json.permalink_url) {
+      permalink = parsed.json.permalink_url as string;
+    }
+  } catch {
+    // ignore
+  }
+
   return { apiId: json.id as string | undefined, permalink };
 }
 
@@ -305,34 +462,49 @@ type PublishArgsIG = {
   media: Media[];
 };
 
-async function publishToInstagram({ igUserId, pageToken, caption, media }: PublishArgsIG) {
-  if (!media.length) throw new Error("no_media_for_ig");
+async function publishToInstagram({
+  igUserId,
+  pageToken,
+  caption,
+  media,
+}: PublishArgsIG) {
+  if (!media.length) {
+    throw new Error("no_media_for_ig");
+  }
+
   const first = media[0];
-  const mt = (first.mime_type ?? "").toLowerCase();
+  const mt = (first.mime_type || "").toLowerCase();
 
   const creation = new URL(`${FB_GRAPH}/${igUserId}/media`);
   if (mt.startsWith("image/")) {
-    creation.searchParams.set("image_url", first.public_url!);
+    creation.searchParams.set("image_url", first.public_url as string);
   } else if (mt.startsWith("video/")) {
     creation.searchParams.set("media_type", "VIDEO");
-    creation.searchParams.set("video_url", first.public_url!);
+    creation.searchParams.set("video_url", first.public_url as string);
   } else {
     throw new Error(`unsupported_media_ig:${mt}`);
   }
-  if (caption) creation.searchParams.set("caption", caption);
+
+  if (caption) {
+    creation.searchParams.set("caption", caption);
+  }
   creation.searchParams.set("access_token", pageToken);
 
-  let cr = await fetch(creation, { method: "POST" });
-  let { ok: cOk, json: cJ, raw: cRaw } = await parseFB(cr);
-  if (!cOk || !cJ?.id) throw new Error(`ig_creation_failed:${cRaw}`);
+  const cr = await fetch(creation, { method: "POST" });
+  const { ok: cOk, json: cJson, raw: cRaw } = await parseFB(cr);
+  if (!cOk || !cJson || !cJson.id) {
+    throw new Error(`ig_creation_failed:${cRaw}`);
+  }
 
   // publish
   const pub = new URL(`${FB_GRAPH}/${igUserId}/media_publish`);
-  pub.searchParams.set("creation_id", cJ.id);
+  pub.searchParams.set("creation_id", cJson.id as string);
   pub.searchParams.set("access_token", pageToken);
   const pr = await fetch(pub, { method: "POST" });
-  const { ok: pOk, json: pJ, raw: pRaw } = await parseFB(pr);
-  if (!pOk || !pJ?.id) throw new Error(`ig_publish_failed:${pRaw}`);
+  const { ok: pOk, json: pJson, raw: pRaw } = await parseFB(pr);
+  if (!pOk || !pJson || !pJson.id) {
+    throw new Error(`ig_publish_failed:${pRaw}`);
+  }
 
-  return { apiId: pJ.id as string | undefined };
+  return { apiId: pJson.id as string | undefined };
 }

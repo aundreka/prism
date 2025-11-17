@@ -1,18 +1,18 @@
 // app/(tabs)/index.tsx
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
   ScrollView,
-  TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
   Alert,
   RefreshControl,
-  Platform,
+  TouchableOpacity,
 } from "react-native";
 import { supabase } from "@/lib/supabase";
-import { router } from "expo-router";
+import { SmartRecommendationsCard } from "@/components/SmartRecommendations";
+import { AnalyticsSection } from "@/components/AnalyticsSection";
 
 type PlatformEnum = "facebook";
 type PostStatusEnum =
@@ -47,21 +47,6 @@ type AnalyticsRow = {
   value: number;
 };
 
-type PostStat = {
-  post: PostRow;
-  impressions: number;
-  engagement: number;
-  likes: number;
-  comments: number;
-  shares: number;
-  saves: number;
-  clicks: number;
-  videoViews: number;
-  latestAt: Date | null;
-  platforms: Set<PlatformEnum>;
-};
-
-// NEW: external_posts (manual + API posts pulled from FB)
 type ExternalPostRow = {
   object_id: string;
   caption: string | null;
@@ -69,41 +54,639 @@ type ExternalPostRow = {
   created_at: string;
 };
 
-// NEW: combined stat type (app + manual)
-type CombinedPostStat = {
-  objectId: string;
-  caption: string;
-  source: "app" | "manual";
-  createdAt: Date;
-  impressions: number;
-  engagement: number;
-};
-
 type DailyEngRow = {
   day: string;
   engagement: number;
 };
 
-type TimeRecommendation = {
+type SmartPlanBrief = {
+  hook: string;
+  caption: string;
+  cta: string;
+  visual_idea: string;
+};
+
+type SmartPlanSlot = {
+  slot_index: number;
   platform: PlatformEnum;
-  timeslot: string;
-  dow: number;
-  hour: number;
-  predicted_avg: number | null;
+  timeslot: string; // ISO string
+  score: number;
+
+  content_type: string; // "reel" | "image" | ...
+  objective: string; // "awareness" | "engagement" | "sales"
+  angle: string; // "promo" | "how_to" | ...
+
   segment_id: number | null;
-  segment_name: string | null;
+  segment_name?: string | null;
+
+  brief: SmartPlanBrief | null;
 };
 
 const BG = "#F8FAFC";
 const TEXT = "#111827";
 const MUTED = "#6B7280";
-const BORDER = "#E5E7EB";
 
-const graphBarHeight = (value: number, max: number) => {
-  if (!max || max <= 0) return 8;
-  const ratio = value / max;
-  return 8 + Math.round(ratio * 52);
+/* ============================================================
+   ANGLE CATALOG — UNIVERSAL + INDUSTRY-SPECIFIC
+   ============================================================ */
+
+// 1) Universal angle families (usable across all industries)
+const UNIVERSAL_ANGLES: string[] = [
+  // Educational / Value
+  "how_to",
+  "step_by_step",
+  "tutorials",
+  "beginner_friendly",
+  "myths_vs_facts",
+  "mistakes_to_avoid",
+  "before_after_explained",
+  "deep_dive",
+  "mini_masterclass",
+  "tools_i_use",
+  "industry_terms_explained",
+
+  // Social Proof / Trust
+  "testimonial",
+  "client_story",
+  "case_study",
+  "transformation",
+  "results_breakdown",
+  "behind_the_scenes",
+  "day_in_the_life",
+  "progress_update",
+  "user_generated_content",
+  "success_path",
+
+  // Emotional / Relatable
+  "relatable_problem",
+  "frustrations",
+  "personal_story",
+  "founder_story",
+  "mission_story",
+  "vulnerable_post",
+  "gratitude_post",
+  "common_struggles",
+  "daily_challenges",
+
+  // Conversion / Offer
+  "promo",
+  "limited_offer",
+  "scarcity",
+  "bundle",
+  "price_reveal",
+  "freebie",
+  "giveaway",
+  "call_to_action",
+  "top_benefits",
+  "faq",
+  "comparison_chart",
+
+  // Engagement Boosters
+  "poll",
+  "question_post",
+  "opinion_prompt",
+  "ranking_list",
+  "challenge",
+  "hot_take",
+  "unpopular_opinion",
+  "debate_starter",
+
+  // Lifestyle
+  "aesthetic_shot",
+  "moodboard",
+  "inspiration",
+  "seasonal_post",
+  "holiday_post",
+  "trends",
+  "lifestyle_fit",
+
+  // Authority / Expert
+  "credibility_boost",
+  "stats_and_data",
+  "research_backed",
+  "certifications",
+  "insider_tips",
+  "pro_secrets",
+  "industry_predictions",
+
+  // Community-Focused
+  "community_highlight",
+  "local_spotlight",
+  "collab",
+  "partnership_post",
+  "charity_support",
+  "volunteer_story",
+];
+
+// 2) Industry-specific pools
+const INDUSTRY_ANGLE_POOLS: Record<string, string[]> = {
+  // Influencer / Content Creator / Gaming / Parenting / DIY
+  influencer: [
+    "trending_sound",
+    "trend_reaction",
+    "stitch_or_duet",
+    "prank_content",
+    "challenge_participation",
+    "aesthetic_unboxing",
+    "day_in_my_life",
+    "room_setup_tour",
+    "productivity_tips",
+    "routines",
+    "transformation_edit",
+    "cosplay",
+    "commentary_take",
+    "realistic_vs_expectation",
+  ],
+  content_creator: [
+    "trending_sound",
+    "trend_reaction",
+    "stitch_or_duet",
+    "challenge_participation",
+    "aesthetic_unboxing",
+    "day_in_my_life",
+    "productivity_tips",
+    "routines",
+    "commentary_take",
+    "realistic_vs_expectation",
+  ],
+  gaming: [
+    "trending_sound",
+    "challenge_participation",
+    "routines",
+    "commentary_take",
+    "realistic_vs_expectation",
+  ],
+  personal_brand: [
+    "day_in_my_life",
+    "founder_story",
+    "origin_story",
+    "mission_story",
+    "realistic_vs_expectation",
+  ],
+
+  // School Organization / Education / Tutor / Language School / Test Prep
+  education: [
+    "study_tips",
+    "exam_hacks",
+    "reviewer_snippets",
+    "campus_life",
+    "org_event_highlights",
+    "student_testimonial",
+    "teacher_profile",
+    "alumni_story",
+    "subject_minilessons",
+    "academic_myth_busting",
+    "club_recruitment",
+    "org_achievements",
+    "competition_results",
+  ],
+  school_organization: [
+    "campus_life",
+    "org_event_highlights",
+    "club_recruitment",
+    "org_achievements",
+    "competition_results",
+  ],
+  tutor: [
+    "study_tips",
+    "exam_hacks",
+    "reviewer_snippets",
+    "subject_minilessons",
+    "academic_myth_busting",
+    "student_testimonial",
+  ],
+  language_school: [
+    "subject_minilessons",
+    "study_tips",
+    "exam_hacks",
+    "student_testimonial",
+    "campus_life",
+  ],
+  test_prep: [
+    "study_tips",
+    "exam_hacks",
+    "reviewer_snippets",
+    "subject_minilessons",
+    "academic_myth_busting",
+  ],
+
+  // Nonprofit / Charity / Advocacy / Mental Health
+  nonprofit: [
+    "impact_story",
+    "volunteer_feature",
+    "donation_use_breakdown",
+    "campaign_pitch",
+    "awareness_fact",
+    "stigma_busting",
+    "call_for_volunteers",
+    "success_metrics",
+    "community_voice",
+    "real_life_case",
+    "advocacy_why",
+    "behind_the_campaign",
+  ],
+  charity: [
+    "impact_story",
+    "volunteer_feature",
+    "donation_use_breakdown",
+    "campaign_pitch",
+    "success_metrics",
+    "community_voice",
+  ],
+  advocacy: [
+    "awareness_fact",
+    "stigma_busting",
+    "advocacy_why",
+    "real_life_case",
+    "behind_the_campaign",
+  ],
+  mental_health: [
+    "awareness_fact",
+    "stigma_busting",
+    "real_life_case",
+    "impact_story",
+    "community_voice",
+    "advocacy_why",
+  ],
+
+  // Real Estate / Home Goods / Interior / Architecture
+  real_estate: [
+    "property_tour",
+    "neighborhood_highlight",
+    "design_trends",
+    "price_breakdown",
+    "market_update",
+    "interior_before_after",
+    "renovation_process",
+    "staging_tips",
+    "buyer_mistakes",
+    "lifestyle_fit_story",
+  ],
+  home_goods: [
+    "design_trends",
+    "interior_before_after",
+    "lifestyle_fit_story",
+    "staging_tips",
+    "buyer_mistakes",
+  ],
+  interior: [
+    "design_trends",
+    "interior_before_after",
+    "renovation_process",
+    "staging_tips",
+    "lifestyle_fit_story",
+  ],
+  architecture: [
+    "design_trends",
+    "interior_before_after",
+    "renovation_process",
+    "project_walkthrough",
+  ],
+
+  // Fitness / Nutritionist / Yoga / Wellness / Spa
+  fitness: [
+    "workout_of_the_day",
+    "nutrition_tip",
+    "mindfulness_exercise",
+    "pose_tutorial",
+    "progress_tracking",
+    "healthy_swap",
+    "myth_busting",
+    "10min_workout",
+    "form_check",
+    "wellness_challenge",
+    "client_result",
+  ],
+  nutritionist: [
+    "nutrition_tip",
+    "healthy_swap",
+    "myth_busting",
+    "progress_tracking",
+    "client_result",
+  ],
+  yoga_studio: [
+    "pose_tutorial",
+    "mindfulness_exercise",
+    "wellness_challenge",
+    "progress_tracking",
+  ],
+  spa_wellness: [
+    "wellness_challenge",
+    "mindfulness_exercise",
+    "healthy_swap",
+    "client_result",
+  ],
+
+  // Beauty / Fashion / Accessories
+  beauty: [
+    "get_ready_with_me",
+    "product_review",
+    "style_guide",
+    "color_palette",
+    "outfit_inspo",
+    "3_ways_to_style",
+    "makeup_tutorial",
+    "transformation",
+    "ingredient_spotlight",
+    "beauty_myths",
+    "new_arrivals",
+  ],
+  fashion_brand: [
+    "style_guide",
+    "color_palette",
+    "outfit_inspo",
+    "3_ways_to_style",
+    "new_arrivals",
+    "customer_favorites",
+  ],
+  accessories: [
+    "aesthetic_shot",
+    "style_guide",
+    "outfit_inspo",
+    "new_arrivals",
+    "bundle",
+  ],
+
+  // Freelancer / VA / Consulting Firm / Agency / Writing / Creative
+  freelancer: [
+    "productivity_workflow",
+    "client_pipeline",
+    "how_i_manage_clients",
+    "deliverable_breakdown",
+    "systems_and_tools",
+    "value_stack",
+    "pricing_philosophy",
+    "process_explained",
+    "mistakes_clients_make",
+    "breakdown_of_a_project",
+  ],
+  virtual_assistant: [
+    "productivity_workflow",
+    "systems_and_tools",
+    "how_i_manage_clients",
+    "process_explained",
+  ],
+  consulting_firm: [
+    "client_pipeline",
+    "case_study",
+    "value_stack",
+    "pricing_philosophy",
+    "process_explined",
+  ],
+  agency: [
+    "case_study",
+    "client_pipeline",
+    "systems_and_tools",
+    "process_explained",
+    "value_stack",
+  ],
+  writer: [
+    "process_explained",
+    "breakdown_of_a_project",
+    "behind_the_scenes",
+    "daily_challenges",
+  ],
+  service_business: [
+    "client_story",
+    "before_after",
+    "process_explained",
+    "mistakes_clients_make",
+  ],
+
+  // Plumber / Electrician / Auto Repair / Landscaping / Cleaning Service
+  plumber: [
+    "before_after_fix",
+    "emergency_tip",
+    "maintenance_reminders",
+    "safety_tips",
+    "signs_you_need_service",
+    "warranty_explanation",
+    "project_walkthrough",
+    "seasonal_checklist",
+    "estimation_guide",
+    "cost_transparency",
+    "best_practices",
+  ],
+  electrician: [
+    "before_after_fix",
+    "safety_tips",
+    "emergency_tip",
+    "maintenance_reminders",
+    "seasonal_checklist",
+    "cost_transparency",
+  ],
+  auto_repair: [
+    "before_after_fix",
+    "signs_you_need_service",
+    "maintenance_reminders",
+    "cost_transparency",
+    "warranty_explanation",
+  ],
+  landscaping: [
+    "project_walkthrough",
+    "before_after_fix",
+    "seasonal_checklist",
+    "best_practices",
+  ],
+  cleaning_service: [
+    "before_after_fix",
+    "project_walkthrough",
+    "maintenance_reminders",
+    "seasonal_checklist",
+    "cost_transparency",
+  ],
+
+  // Restaurants / Cafes / Food Truck / Catering
+  restaurant: [
+    "recipe_teaser",
+    "menu_highlight",
+    "chef_special",
+    "food_aesthetic",
+    "behind_the_kitchen",
+    "sourcing_ingredients",
+    "signature_dish_story",
+    "seasonal_menu",
+    "customer_favorites",
+    "price_bundle",
+    "limited_time_item",
+  ],
+  cafe: [
+    "menu_highlight",
+    "food_aesthetic",
+    "signature_dish_story",
+    "seasonal_menu",
+    "customer_favorites",
+    "limited_time_item",
+  ],
+
+  // Clinic / Wellness / Therapist
+  clinic: [
+    "health_tip",
+    "symptom_explainer",
+    "when_to_seek_help",
+    "patient_story",
+    "treatment_process",
+    "equipment_explained",
+    "health_myth_busting",
+    "doctor_profile",
+    "clinic_tour",
+    "recovery_guide",
+  ],
+  therapist: [
+    "health_tip",
+    "symptom_explainer",
+    "when_to_seek_help",
+    "patient_story",
+    "recovery_guide",
+  ],
+
+  // Local Business / Personal Brand
+  local_business: [
+    "founder_intro",
+    "origin_story",
+    "mission",
+    "community_support",
+    "customer_review",
+    "highlights_of_the_week",
+    "local_event",
+  ],
+
+  // Photography / Videography / Artist / Voice Actor
+  photography: [
+    "shoot_breakdown",
+    "lighting_setup",
+    "color_grading_before_after",
+    "gear_talk",
+    "behind_the_shot",
+    "client_testimonial",
+    "inspiration",
+    "portfolio_piece",
+    "technique_tutorial",
+  ],
+  videography: [
+    "shoot_breakdown",
+    "lighting_setup",
+    "color_grading_before_after",
+    "gear_talk",
+    "behind_the_shot",
+    "portfolio_piece",
+    "technique_tutorial",
+  ],
+  artist: [
+    "behind_the_shot",
+    "portfolio_piece",
+    "technique_tutorial",
+    "inspiration",
+  ],
+  voice_actor: [
+    "portfolio_piece",
+    "behind_the_scenes",
+    "process_explained",
+  ],
+
+  // SAAS / Tech Startup / IT Services / Web Agency / Mobile App
+  saas: [
+    "feature_spotlight",
+    "product_update",
+    "roadmap",
+    "use_case_explainer",
+    "micro_demo",
+    "case_study",
+    "onboarding_tips",
+    "performance_metrics",
+    "integration_how_to",
+    "user_story",
+  ],
+  tech_startup: [
+    "feature_spotlight",
+    "product_update",
+    "roadmap",
+    "use_case_explainer",
+    "micro_demo",
+    "user_story",
+  ],
+  it_services: [
+    "use_case_explainer",
+    "case_study",
+    "integration_how_to",
+    "performance_metrics",
+  ],
+  web_agency: [
+    "feature_spotlight",
+    "case_study",
+    "micro_demo",
+    "use_case_explainer",
+  ],
+  mobile_app: [
+    "feature_spotlight",
+    "micro_demo",
+    "onboarding_tips",
+    "user_story",
+  ],
 };
+
+// Helper: normalize industry string -> key for INDUSTRY_ANGLE_POOLS
+const normalizeIndustry = (raw?: string | null): string =>
+  (raw ?? "other").toLowerCase();
+
+// Helper: fuzzy mapping when enum name and group labels differ slightly
+function getIndustrySpecificAngles(industry?: string | null): string[] {
+  const key = normalizeIndustry(industry);
+
+  if (INDUSTRY_ANGLE_POOLS[key]) {
+    return INDUSTRY_ANGLE_POOLS[key];
+  }
+
+  // Fuzzy fallbacks (if your enum names differ)
+  if (key.includes("school") || key.includes("org")) {
+    return INDUSTRY_ANGLE_POOLS["education"] ?? [];
+  }
+  if (key.includes("saas") || key.includes("startup") || key.includes("tech")) {
+    return INDUSTRY_ANGLE_POOLS["saas"] ?? [];
+  }
+  if (key.includes("photography")) {
+    return INDUSTRY_ANGLE_POOLS["photography"] ?? [];
+  }
+  if (key.includes("fitness") || key.includes("gym")) {
+    return INDUSTRY_ANGLE_POOLS["fitness"] ?? [];
+  }
+  if (key.includes("yoga")) {
+    return INDUSTRY_ANGLE_POOLS["yoga_studio"] ?? [];
+  }
+  if (key.includes("spa") || key.includes("wellness")) {
+    return INDUSTRY_ANGLE_POOLS["spa_wellness"] ?? [];
+  }
+  if (key.includes("clinic") || key.includes("therapist")) {
+    return INDUSTRY_ANGLE_POOLS["clinic"] ?? [];
+  }
+  if (key.includes("restaurant") || key.includes("food")) {
+    return INDUSTRY_ANGLE_POOLS["restaurant"] ?? [];
+  }
+  if (key.includes("cafe") || key.includes("coffee")) {
+    return INDUSTRY_ANGLE_POOLS["cafe"] ?? [];
+  }
+  if (key.includes("agency")) {
+    return INDUSTRY_ANGLE_POOLS["agency"] ?? [];
+  }
+  if (key.includes("freelancer")) {
+    return INDUSTRY_ANGLE_POOLS["freelancer"] ?? [];
+  }
+
+  return [];
+}
+
+// Final helper: build full angle pool for a brand
+function buildAnglePoolForIndustry(industry?: string | null): string[] {
+  const universal = UNIVERSAL_ANGLES;
+  const specific = getIndustrySpecificAngles(industry);
+  // de-dup
+  const merged = [...universal, ...specific];
+  return Array.from(new Set(merged));
+}
+
+/* ============================================================
+   DASHBOARD COMPONENT
+   ============================================================ */
 
 export default function Home() {
   const [loading, setLoading] = useState(true);
@@ -113,14 +696,13 @@ export default function Home() {
   const [sched, setSched] = useState<SchedRow[]>([]);
   const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
   const [externalPosts, setExternalPosts] = useState<ExternalPostRow[]>([]);
-
   const [dailyEng, setDailyEng] = useState<DailyEngRow[]>([]);
-  const [timeRecs, setTimeRecs] = useState<TimeRecommendation[]>([]);
-  const [recError, setRecError] = useState<string | null>(null);
-  const [showMath, setShowMath] = useState(false);
-  
 
-  // ---------- DATA LOADER ----------
+  // 7-Day Smart Plan state
+  const [smartPlan, setSmartPlan] = useState<SmartPlanSlot[] | null>(null);
+  const [smartPlanLoading, setSmartPlanLoading] = useState(false);
+  const [applyingSmartPlan, setApplyingSmartPlan] = useState(false);
+
   const loadDashboard = useCallback(
     async (opts?: { silent?: boolean }) => {
       try {
@@ -133,14 +715,11 @@ export default function Home() {
           return;
         }
 
-        // 🔹 Call backfill_fb_insights every time we load the dashboard
-        // This fetches historical manual posts + insights and upserts into analytics_events + external_posts.
+        // 1) Backfill FB insights (manual + API posts)
         try {
           const { data: fbData, error: fbError } =
             await supabase.functions.invoke("backfill_fb_insights", {
-              body: {
-                userId: user.id,
-              },
+              body: { userId: user.id },
             });
 
           if (fbError) {
@@ -150,14 +729,13 @@ export default function Home() {
           }
         } catch (err) {
           console.log("backfill_fb_insights invoke failed:", err);
-          // non-fatal; we still load whatever data is already in DB
         }
+
+        // 2) meta_publish_worker to process any pending schedules
         try {
           const { data: publishData, error: publishError } =
             await supabase.functions.invoke("meta_publish_worker", {
-              body: {
-                userId: user.id,
-              },
+              body: { userId: user.id },
             });
 
           if (publishError) {
@@ -167,12 +745,9 @@ export default function Home() {
           }
         } catch (err) {
           console.log("meta_publish_worker invoke failed:", err);
-          // non-fatal; we still load whatever data is already in DB
         }
 
-
-
-        // 1) App-created posts
+        // 3) Posts created in Prism
         const { data: p, error: ep } = await supabase
           .from("posts")
           .select("id,user_id,caption,post_type,created_at")
@@ -183,7 +758,7 @@ export default function Home() {
         const postsData = (p || []) as PostRow[];
         setPosts(postsData);
 
-        // 2) Schedules (FB only) for app posts
+        // 4) Schedules for these posts (FB only)
         let schedData: SchedRow[] = [];
         if (postsData.length) {
           const postIds = postsData.map((x) => x.id);
@@ -200,7 +775,7 @@ export default function Home() {
         }
         setSched(schedData);
 
-        // 3) External posts (manual + API posts from FB)
+        // 5) external_posts (manual + API posts)
         const { data: ex, error: eEx } = await supabase
           .from("external_posts")
           .select("object_id, caption, content_type, created_at")
@@ -214,19 +789,14 @@ export default function Home() {
         const externalData = (ex || []) as ExternalPostRow[];
         setExternalPosts(externalData);
 
-        // 4) Analytics for all relevant object_ids (app + manual)
+        // 6) analytics_events for all relevant object_ids
         const objectIdsSet = new Set<string>();
-
-        // app posts → scheduled_posts.api_post_id
         for (const s of schedData) {
           if (s.api_post_id) objectIdsSet.add(s.api_post_id);
         }
-
-        // manual + app posts from FB → external_posts.object_id
         for (const exPost of externalData) {
           if (exPost.object_id) objectIdsSet.add(exPost.object_id);
         }
-
         const objectIds = Array.from(objectIdsSet);
 
         if (objectIds.length) {
@@ -242,7 +812,7 @@ export default function Home() {
           setAnalytics([]);
         }
 
-        // 5) Daily engagement (from v_user_recent_engagement)
+        // 7) Daily engagement (from v_user_recent_engagement)
         const { data: engRows, error: eEng } = await supabase
           .from("v_user_recent_engagement")
           .select("day, engagement")
@@ -254,26 +824,6 @@ export default function Home() {
           console.log("v_user_recent_engagement error:", eEng);
         }
         setDailyEng((engRows || []) as DailyEngRow[]);
-
-        // 6) Time + Segment recommendations (FB only)
-        setRecError(null);
-        const { data: recs, error: er } = await supabase.rpc(
-          "get_time_segment_recommendations",
-          {
-            p_platform: "facebook",
-          }
-        );
-
-        if (er) {
-          console.log("get_time_segment_recommendations error:", er);
-          setRecError(er.message ?? "Could not load recommendations.");
-          setTimeRecs([]);
-        } else {
-          const fbRecs = ((recs || []) as TimeRecommendation[]).filter(
-            (r) => r.platform === "facebook"
-          );
-          setTimeRecs(fbRecs);
-        }
       } catch (e: any) {
         console.error("Dashboard load error:", e);
         Alert.alert("Error", e?.message ?? "Failed to load dashboard.");
@@ -285,7 +835,6 @@ export default function Home() {
     []
   );
 
-  // ---------- First load: still calling insights_pull (your existing function) ----------
   const bootstrapDashboard = useCallback(async () => {
     try {
       setLoading(true);
@@ -313,7 +862,6 @@ export default function Home() {
     bootstrapDashboard();
   }, [bootstrapDashboard]);
 
-  // ---------- Pull-to-refresh ----------
   const handleRefresh = useCallback(async () => {
     try {
       setRefreshing(true);
@@ -341,411 +889,223 @@ export default function Home() {
     }
   }, [loadDashboard]);
 
-  // ---------- Helpers ----------
-  const formatNumber = (n: number) =>
-    n >= 1000000
-      ? `${(n / 1000000).toFixed(1)}M`
-      : n >= 1000
-      ? `${(n / 1000).toFixed(1)}k`
-      : `${n}`;
+  /**
+   * 7-Day Smart Plan generator
+   *
+   * From the mobile app:
+   * 1) rpc('generate_7day_smart_plan', { p_platform: 'facebook', p_n_slots: 7 })
+   * 2) rpc('get_content_mix_recommendations', { p_platform: 'facebook' })
+   * 3) select from v_segment_engagement_scores
+   * 4) invoke edge function 'generate_smart_plan_briefs' (OpenAI) to get hook/caption/CTA/visual
+   */
+  const loadSmartPlan = useCallback(async () => {
+    try {
+      setSmartPlanLoading(true);
 
-  const barWidthPct = (val: number, max: number) =>
-    `${Math.max(6, Math.min(100, (val / (max || 1)) * 100))}%`;
+      const { data: userData } = await supabase.auth.getUser();
+      const user = userData?.user;
+      if (!user) {
+        Alert.alert("Sign in required", "Please sign in to generate a plan.");
+        return;
+      }
 
-  const formatTimeSlot = (iso: string) => {
-    const d = new Date(iso);
-    return d.toLocaleString(undefined, {
-      weekday: "short",
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  };
-
-  const segmentLabel = (segmentName: string | null, segmentId: number | null) => {
-    if (segmentName) return segmentName;
-    if (segmentId != null) return `Segment ${segmentId}`;
-    return "All followers";
-  };
-
-  const formatHourLabel = (hour: number) => {
-    const h = Math.max(0, Math.min(23, hour));
-    const ampm = h >= 12 ? "PM" : "AM";
-    const hour12 = ((h + 11) % 12) + 1; // 0→12, 13→1, etc.
-    return `${hour12}${ampm}`;
-  };
-
-  // Analytics mapping: object_id -> metric map (using MAX per metric)
-  const analyticsByObject = useMemo(() => {
-    const map = new Map<string, Record<string, number>>();
-    for (const a of analytics) {
-      if (!a.object_id) continue;
-      if (!map.has(a.object_id)) map.set(a.object_id, {});
-      const bucket = map.get(a.object_id)!;
-      const val = Number(a.value) || 0;
-      bucket[a.metric] = Math.max(bucket[a.metric] || 0, val);
-    }
-    return map;
-  }, [analytics]);
-
-  // Build per-post stats (app-created posts only, for Recent Posts)
-  const postStats: PostStat[] = useMemo(() => {
-    const stats: PostStat[] = [];
-
-    for (const post of posts) {
-      const srows = sched.filter((s) => s.post_id === post.id);
-
-      let impressions = 0;
-      let likes = 0;
-      let comments = 0;
-      let shares = 0;
-      let saves = 0;
-      let clicks = 0;
-      let videoViews = 0;
-      let engagement = 0;
-      let latestAt: Date | null = null;
-      const platforms = new Set<PlatformEnum>();
-
-      for (const s of srows) {
-        const scheduleTs = s.posted_at || s.scheduled_at;
-        if (scheduleTs) {
-          const dt = new Date(scheduleTs);
-          if (!latestAt || dt > latestAt) latestAt = dt;
+      // --- NEW: fetch brand industry to bias angle selection ---
+      let brandIndustry: string | null = null;
+      try {
+        const { data: brandRows, error: brandErr } = await supabase
+          .from("brand_profiles")
+          .select("industry")
+          .eq("user_id", user.id)
+          .limit(1);
+        if (brandErr) {
+          console.log("brand_profiles error:", brandErr);
+        } else if (brandRows && brandRows.length > 0) {
+          // industry is enum in DB, string in JS
+          brandIndustry = (brandRows[0] as any).industry ?? null;
         }
-        platforms.add(s.platform);
-
-        if (!s.api_post_id) continue;
-        const bucket = analyticsByObject.get(s.api_post_id);
-        if (!bucket) continue;
-
-        const imp = bucket["impressions"] || 0;
-        const like = bucket["likes"] || 0;
-        const comm = bucket["comments"] || 0;
-        const sh = bucket["shares"] || 0;
-        const sv = bucket["saves"] || 0;
-        const clk = bucket["clicks"] || 0;
-        const vv = bucket["video_views"] || 0;
-
-        impressions += imp;
-        likes += like;
-        comments += comm;
-        shares += sh;
-        saves += sv;
-        clicks += clk;
-        videoViews += vv;
-
-        // Engagement = likes + comments + shares
-        engagement += like + comm + sh;
+      } catch (e) {
+        console.log("brand_profiles fetch failed:", e);
       }
 
-      stats.push({
-        post,
-        impressions,
-        engagement,
-        likes,
-        comments,
-        shares,
-        saves,
-        clicks,
-        videoViews,
-        latestAt,
-        platforms,
-      });
-    }
+      const anglePool = buildAnglePoolForIndustry(brandIndustry);
+      const anglePoolLen = Math.max(anglePool.length, 1);
 
-    return stats;
-  }, [posts, sched, analyticsByObject]);
+      // 1) Get best upcoming slots (time bandit + priors)
+      const { data: baseSlots, error: baseErr } = await supabase.rpc(
+        "generate_7day_smart_plan",
+        { p_platform: "facebook", p_n_slots: 7 }
+      );
 
-  // ----- Combined meta: app + manual posts, keyed by FB object_id -----
-  const combinedMetaByObject = useMemo(() => {
-    const map = new Map<
-      string,
-      { caption: string; createdAt: Date; source: "app" | "manual" }
-    >();
+      if (baseErr) {
+        console.error("generate_7day_smart_plan error:", baseErr);
+        throw baseErr;
+      }
 
-    // 1) Manual + API posts from external_posts
-    for (const ex of externalPosts) {
-      const objectId = ex.object_id;
-      if (!objectId) continue;
-      const caption = ex.caption || "(no caption)";
-      const createdAt = new Date(ex.created_at);
+      const baseSlotsArr: any[] = (baseSlots || []) as any[];
 
-      const existing = map.get(objectId);
-      if (!existing || createdAt > existing.createdAt) {
-        map.set(objectId, {
-          caption,
-          createdAt,
-          source: existing?.source === "app" ? "app" : "manual",
+      if (!baseSlotsArr.length) {
+        Alert.alert(
+          "Smart Plan",
+          "No recommended time slots available yet. Try again after some analytics data comes in."
+        );
+        setSmartPlan([]);
+        return;
+      }
+
+      // 2) Get content mix response (what types/angles tend to work)
+      const { data: mixData, error: mixErr } = await supabase.rpc(
+        "get_content_mix_recommendations",
+        { p_platform: "facebook" }
+      );
+      if (mixErr) {
+        console.error("get_content_mix_recommendations error:", mixErr);
+        throw mixErr;
+      }
+
+      const mixArr: any[] = (mixData || []) as any[];
+
+      // 3) Segment scores (who tends to respond)
+      const { data: segRows, error: segErr } = await supabase
+        .from("v_segment_engagement_scores")
+        .select("segment_id, segment_engagement_rate, segment_name, platform")
+        .eq("user_id", user.id)
+        .eq("platform", "facebook");
+
+      if (segErr) {
+        console.error("v_segment_engagement_scores error:", segErr);
+        // Not fatal; we can still make a plan without segments
+      }
+
+      const segArr: any[] = (segRows || []) as any[];
+
+      // Sort mixes and segments by their scores (if present)
+      const sortedMix = [...mixArr].sort(
+        (a, b) =>
+          (b.expected_engagement_rate ?? 0) -
+          (a.expected_engagement_rate ?? 0)
+      );
+
+      const sortedSegments = [...segArr].sort(
+        (a, b) =>
+          (b.segment_engagement_rate ?? 0) -
+          (a.segment_engagement_rate ?? 0)
+      );
+
+      const mixLen = Math.max(sortedMix.length, 1);
+      const segLen = Math.max(sortedSegments.length || 0, 1);
+
+      // 4) Assign content_type + objective + angle + segment locally (simple greedy)
+      const designedSlots: SmartPlanSlot[] = baseSlotsArr.map(
+        (raw: any, idx: number) => {
+          const mix = sortedMix[idx % mixLen] || {};
+          const seg =
+            sortedSegments.length > 0
+              ? sortedSegments[idx % segLen] || {}
+              : {};
+
+          // Prefer learned mix angle if it's specific (not "generic");
+          // fall back to curated angle pool for this industry.
+          const mixAngle =
+            typeof mix.angle === "string" && mix.angle !== "generic"
+              ? mix.angle
+              : null;
+
+          const defaultAngle =
+            anglePoolLen > 0 ? anglePool[idx % anglePoolLen] : "promo";
+
+          const chosenAngle = mixAngle || defaultAngle;
+
+          return {
+            slot_index: raw.slot_index ?? idx + 1,
+            platform: "facebook",
+            timeslot: raw.timeslot,
+            score: raw.score ?? raw.predicted_avg ?? 0,
+            content_type: mix.content_type ?? "image",
+            objective: mix.objective ?? "engagement",
+            angle: chosenAngle,
+            segment_id:
+              typeof seg.segment_id === "number" ? seg.segment_id : null,
+            segment_name: seg.segment_name ?? null,
+            brief: null,
+          };
+        }
+      );
+
+      // 5) Call OpenAI Edge Function to generate actual creative briefs
+      const { data: briefResp, error: briefErr } =
+        await supabase.functions.invoke("generate_smart_plan_briefs", {
+          body: {
+            platform: "facebook",
+            slots: designedSlots,
+          },
         });
+
+      if (briefErr) {
+        console.error("generate_smart_plan_briefs error:", briefErr);
+        throw briefErr;
       }
+
+      const finalSlots: SmartPlanSlot[] =
+        (briefResp?.slots as SmartPlanSlot[]) ?? designedSlots;
+
+      setSmartPlan(finalSlots);
+    } catch (e: any) {
+      console.error("loadSmartPlan error:", e);
+      Alert.alert(
+        "Smart Plan",
+        e?.message ?? "Failed to generate 7-day smart plan."
+      );
+    } finally {
+      setSmartPlanLoading(false);
     }
+  }, []);
 
-    // 2) App-created posts via scheduled_posts.api_post_id
-    for (const s of sched) {
-      if (!s.api_post_id) continue;
-      const objectId = s.api_post_id;
-      const post = posts.find((p) => p.id === s.post_id);
-
-      const caption = post?.caption || "(no caption)";
-      let createdAt: Date;
-      if (s.posted_at) createdAt = new Date(s.posted_at);
-      else if (s.scheduled_at) createdAt = new Date(s.scheduled_at);
-      else if (post?.created_at) createdAt = new Date(post.created_at);
-      else createdAt = new Date();
-
-      const existing = map.get(objectId);
-      if (!existing) {
-        map.set(objectId, { caption, createdAt, source: "app" });
-      } else {
-        // Prefer app as source, and the latest createdAt
-        const newerDate =
-          createdAt > existing.createdAt ? createdAt : existing.createdAt;
-        const source: "app" | "manual" =
-          existing.source === "app" ? "app" : "app"; // once app, always app
-        map.set(objectId, {
-          caption,
-          createdAt: newerDate,
-          source,
-        });
+  const handleApplySmartPlan = useCallback(
+    async () => {
+      if (!smartPlan || smartPlan.length === 0) {
+        Alert.alert("Smart Plan", "Generate a plan first.");
+        return;
       }
-    }
 
-    return map;
-  }, [externalPosts, sched, posts]);
+      try {
+        setApplyingSmartPlan(true);
 
-  const dayMs = 24 * 60 * 60 * 1000;
+        const { data, error } = await supabase.functions.invoke(
+          "apply_smart_plan",
+          {
+            body: {
+              platform: "facebook",
+              slots: smartPlan,
+            },
+          }
+        );
 
-  // Posts with analytics in the last 30 calendar days (app + manual)
-  const combinedStatsLast30 = useMemo<CombinedPostStat[]>(() => {
-    const now = new Date();
-    const start30 = new Date(now.getTime() - 29 * dayMs);
+        if (error) {
+          console.error("apply_smart_plan error:", error);
+          throw error;
+        }
 
-    const results: CombinedPostStat[] = [];
+        console.log("apply_smart_plan OK:", data);
+        Alert.alert(
+          "Smart Plan",
+          "Draft schedules created from your 7-day plan."
+        );
 
-    for (const [objectId, meta] of combinedMetaByObject.entries()) {
-      if (meta.createdAt < start30) continue;
-      const bucket = analyticsByObject.get(objectId);
-      if (!bucket) continue;
-
-      const impressions = bucket["impressions"] || 0;
-      const likes = bucket["likes"] || 0;
-      const comments = bucket["comments"] || 0;
-      const shares = bucket["shares"] || 0;
-      const engagement = likes + comments + shares;
-
-      if (impressions === 0 && engagement === 0) continue;
-
-      results.push({
-        objectId,
-        caption: meta.caption,
-        source: meta.source,
-        createdAt: meta.createdAt,
-        impressions,
-        engagement,
-      });
-    }
-
-    return results;
-  }, [combinedMetaByObject, analyticsByObject, dayMs]);
-
-  // Total posts with any analytics (all-time, app + manual)
-  const totalPostsWithAnalytics = useMemo(() => {
-    let count = 0;
-    for (const [objectId] of combinedMetaByObject.entries()) {
-      if (analyticsByObject.has(objectId)) count++;
-    }
-    return count;
-  }, [combinedMetaByObject, analyticsByObject]);
-
-  // Posts with analytics in the last 7 days (app + manual)
-  const postsLast7Count = useMemo(() => {
-    const now = new Date();
-    const cutoff = new Date(now.getTime() - 6 * dayMs);
-
-    let count = 0;
-    for (const [objectId, meta] of combinedMetaByObject.entries()) {
-      if (!analyticsByObject.has(objectId)) continue;
-      if (meta.createdAt >= cutoff) count++;
-    }
-    return count;
-  }, [combinedMetaByObject, analyticsByObject, dayMs]);
-
-  // ----- KPIs (now use combinedStatsLast30 + all analytics posts) -----
-  const kpis = useMemo(() => {
-    const totalPosts = totalPostsWithAnalytics;
-    const postsThisWeek = postsLast7Count;
-
-    let totalImpressions30 = 0;
-    let sumEngRate30 = 0;
-    let countEngRate30 = 0;
-
-    for (const s of combinedStatsLast30) {
-      totalImpressions30 += s.impressions;
-      if (s.impressions > 0) {
-        sumEngRate30 += s.engagement / s.impressions;
-        countEngRate30 += 1;
+        // Reload dashboard so new drafts appear
+        await loadDashboard({ silent: true });
+      } catch (e: any) {
+        console.error("handleApplySmartPlan error:", e);
+        Alert.alert(
+          "Smart Plan",
+          e?.message ?? "Failed to convert plan into drafts."
+        );
+      } finally {
+        setApplyingSmartPlan(false);
       }
-    }
+    },
+    [smartPlan, loadDashboard]
+  );
 
-    const avgEngagementRate30 = countEngRate30
-      ? (sumEngRate30 / countEngRate30) * 100
-      : 0;
-
-    return [
-      {
-        label: "Total Posts with Analytics",
-        value: String(totalPosts),
-        hint: "All-time (FB, app + manual)",
-      },
-      {
-        label: "Posts (Last 7 days)",
-        value: String(postsThisWeek),
-        hint: "With analytics, last 7 days",
-      },
-      {
-        label: "Total Impressions (30d)",
-        value: formatNumber(totalImpressions30),
-        hint: "FB posts with analytics",
-      },
-      {
-        label: "Avg Engagement Rate (30d)",
-        value: `${avgEngagementRate30.toFixed(1)}%`,
-        hint: "Posts with impressions",
-      },
-    ];
-  }, [combinedStatsLast30, postsLast7Count, totalPostsWithAnalytics]);
-
-  // ----- Recent posts (app-created only, as before) -----
-  const recentPosts = useMemo(() => {
-    const sortedPosts = [...posts].sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    );
-    const subset = sortedPosts.slice(0, 5);
-
-    return subset.map((post) => {
-      const stat = postStats.find((s) => s.post.id === post.id);
-      const srows = sched.filter((s) => s.post_id === post.id);
-
-      let status: "Published" | "Scheduled" | "Draft" = "Draft";
-      if (srows.some((s) => s.status === "posted")) status = "Published";
-      else if (
-        srows.some((s) => s.status === "scheduled" || s.status === "posting")
-      )
-        status = "Scheduled";
-
-      let date: Date = new Date(post.created_at);
-      const posted = srows
-        .filter((s) => s.posted_at)
-        .map((s) => new Date(s.posted_at!))
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-      const scheduled = srows
-        .filter((s) => s.scheduled_at)
-        .map((s) => new Date(s.scheduled_at!))
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-      if (posted) date = posted;
-      else if (scheduled) date = scheduled;
-
-      const platforms = stat ? Array.from(stat.platforms) : [];
-      const impressions = stat?.impressions || 0;
-      const engRate =
-        stat && stat.impressions > 0
-          ? (stat.engagement / stat.impressions) * 100
-          : 0;
-
-      return {
-        id: post.id,
-        caption: post.caption || "(no caption)",
-        status,
-        date,
-        platforms,
-        impressions,
-        engRate,
-      };
-    });
-  }, [posts, postStats, sched]);
-
-  // ----- Engagement trend (Last 7 days) from SQL view -----
-  const engagementTrend = useMemo(() => {
-    if (!dailyEng.length) {
-      return { series: [] as { key: string; label: string; value: number }[], maxVal: 0 };
-    }
-
-    let maxVal = 0;
-    const series = dailyEng.map((row) => {
-      const d = new Date(row.day);
-      const value = Number(row.engagement) || 0;
-      if (value > maxVal) maxVal = value;
-
-      return {
-        key: row.day,
-        label: d.toLocaleDateString(undefined, {
-          weekday: "short",
-        }),
-        value,
-      };
-    });
-
-    return { series, maxVal };
-  }, [dailyEng]);
-
-  const hasTrendData = engagementTrend.series.some((d) => d.value > 0);
-
-  // ----- Recommendation calendar (next 7 days) -----
-  const recCalendar = useMemo(() => {
-    if (!timeRecs.length) return [];
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const rawMap = new Map<
-      string,
-      { date: Date; slots: { hour: number; score: number | null }[] }
-    >();
-
-    for (const r of timeRecs) {
-      const d = new Date(r.timeslot);
-      const localDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const key = localDate.toISOString().slice(0, 10);
-      if (!rawMap.has(key)) {
-        rawMap.set(key, { date: localDate, slots: [] });
-      }
-      rawMap.get(key)!.slots.push({
-        hour: d.getHours(),
-        score: r.predicted_avg,
-      });
-    }
-
-    const days: {
-      key: string;
-      date: Date;
-      slots: { hour: number; score: number | null }[];
-    }[] = [];
-
-    for (let i = 0; i < 7; i++) {
-      const dayDate = new Date(today);
-      dayDate.setDate(today.getDate() + i);
-      const key = dayDate.toISOString().slice(0, 10);
-      const entry = rawMap.get(key) || { date: dayDate, slots: [] };
-
-      const sortedSlots = [...entry.slots]
-        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-        .slice(0, 3);
-
-      days.push({
-        key,
-        date: dayDate,
-        slots: sortedSlots,
-      });
-    }
-
-    return days;
-  }, [timeRecs]);
-
-  const topTimeRecs = timeRecs.slice(0, 5);
-
-  // ---------- RENDER ----------
   if (loading) {
     return (
       <View
@@ -755,7 +1115,9 @@ export default function Home() {
         ]}
       >
         <ActivityIndicator />
-        <Text style={{ color: MUTED, marginTop: 8 }}>Loading dashboard…</Text>
+        <Text style={{ color: MUTED, marginTop: 8 }}>
+          Loading dashboard…
+        </Text>
       </View>
     );
   }
@@ -781,377 +1143,151 @@ export default function Home() {
         </Text>
       </View>
 
-      {/* KPIs */}
-      <View style={styles.kpiRow}>
-        {kpis.map((k) => (
-          <View key={k.label} style={styles.kpiCard}>
-            <Text style={styles.kpiValue}>{k.value}</Text>
-            <Text style={styles.kpiLabel}>{k.label}</Text>
-            <Text style={styles.kpiHint}>{k.hint}</Text>
+      {/* 7-Day Smart Plan */}
+      <View style={styles.section}>
+        <View style={styles.sectionHeaderRow}>
+          <View style={{ flex: 1, paddingRight: 8 }}>
+            <Text style={styles.sectionTitle}>PRISM 7-Day Smart Plan</Text>
+            <Text style={styles.sectionSubtitle}>
+              Auto-generated schedule & content ideas from your data, goals,
+              audience segments, and angle playbook.
+            </Text>
           </View>
-        ))}
-      </View>
+          <View style={styles.sectionHeaderActions}>
+            <TouchableOpacity
+              style={styles.primaryButton}
+              onPress={loadSmartPlan}
+              disabled={smartPlanLoading}
+            >
+              {smartPlanLoading ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Text style={styles.primaryButtonText}>Generate Plan</Text>
+              )}
+            </TouchableOpacity>
 
-      {/* Smart Recommendations — When to Post */}
-      <Text style={styles.sectionTitle}>Smart Recommendations</Text>
-      <View style={styles.card}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.cardTitle}>Best time to post (next 7 days)</Text>
-          <TouchableOpacity
-            onPress={() => router.push("/calendar")}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.linkText}>Open calendar ›</Text>
-          </TouchableOpacity>
+            {smartPlan && smartPlan.length > 0 && (
+              <TouchableOpacity
+                style={[
+                  styles.ghostButton,
+                  applyingSmartPlan && { opacity: 0.6 },
+                ]}
+                onPress={handleApplySmartPlan}
+                disabled={applyingSmartPlan}
+              >
+                {applyingSmartPlan ? (
+                  <ActivityIndicator size="small" />
+                ) : (
+                  <Text style={styles.ghostButtonText}>Convert to Drafts</Text>
+                )}
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
 
-        {recError ? (
-          <Text style={{ color: "#B91C1C", fontSize: 12, marginTop: 8 }}>
-            {recError}
-          </Text>
-        ) : !timeRecs.length ? (
-          <Text style={{ color: MUTED, fontSize: 12, marginTop: 8 }}>
-            Not enough engagement data yet. Once your posts start getting
-            activity, we’ll recommend the best upcoming times and audience
-            segments.
-          </Text>
-        ) : (
-          <>
-            {/* Mini calendar view of recommended hours */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={{ marginTop: 12 }}
-            >
-              {recCalendar.map((day) => {
-                const isToday =
-                  day.date.toDateString() === new Date().toDateString();
-                return (
-                  <TouchableOpacity
-                    key={day.key}
-                    style={[
-                      styles.recDayCell,
-                      isToday && styles.recDayToday,
-                    ]}
-                    activeOpacity={0.8}
-                    onPress={() => router.push("/calendar")}
-                  >
-                    <Text
-                      style={[
-                        styles.recDayLabel,
-                        isToday && styles.recDayLabelToday,
-                      ]}
-                    >
-                      {day.date.toLocaleDateString(undefined, {
-                        weekday: "short",
-                      })}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.recDayNumber,
-                        isToday && styles.recDayNumberToday,
-                      ]}
-                    >
-                      {day.date.getDate()}
-                    </Text>
-                    <View style={{ marginTop: 6 }}>
-                      {day.slots.length === 0 ? (
-                        <Text style={styles.recDayNoData}>No picks</Text>
-                      ) : (
-                        day.slots.map((slot, idx) => {
-                          const scorePct =
-                            slot.score != null
-                              ? `${Math.round((slot.score || 0) * 100)}%`
-                              : "—";
-                          return (
-                            <View
-                              key={`${slot.hour}-${idx}`}
-                              style={styles.recSlotRow}
-                            >
-                              <Text style={styles.recSlotTime}>
-                                {formatHourLabel(slot.hour)}
-                              </Text>
-                              <Text style={styles.recSlotScore}>{scorePct}</Text>
-                            </View>
-                          );
-                        })
-                      )}
-                    </View>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            {/* Top individual slots list (optional quick view) */}
-            {topTimeRecs.length > 0 && (
-              <View style={{ marginTop: 14 }}>
-                {topTimeRecs.map((r, idx) => {
-                  const scorePct =
-                    r.predicted_avg != null
-                      ? `${(r.predicted_avg * 100).toFixed(0)}%`
-                      : "N/A";
-                  return (
-                    <View
-                      key={`${r.platform}-${r.timeslot}-${idx}`}
-                      style={{ marginBottom: 6 }}
-                    >
-                      <View style={styles.rowBetween}>
-                        <View style={styles.row}>
-                          <Text style={styles.perfLabel}>
-                            {formatTimeSlot(r.timeslot)}
-                          </Text>
-                        </View>
-                        <Text style={[styles.pmValue, { fontSize: 13 }]}>
-                          Score: {scorePct}
-                        </Text>
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
-            )}
-
-            {/* Explanation toggle */}
-            <View style={styles.mathToggleRow}>
-              <View style={{ flexDirection: "row", alignItems: "center" }}>
-                <Text style={styles.mathTitle}>How this score is calculated</Text>
-              </View>
-              <TouchableOpacity
-                onPress={() => setShowMath((prev) => !prev)}
-                style={styles.infoButton}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.infoIcon}>i</Text>
-              </TouchableOpacity>
-            </View>
-
-            {showMath && (
-              <View style={styles.mathBox}>
-                {/* Step 1 */}
-                <View style={styles.mathStep}>
-                  <Text style={styles.mathStepLabel}>1.</Text>
-                  <View style={styles.mathStepBody}>
-                    <Text style={styles.mathText}>
-                      From your post analytics, we build hourly features in{" "}
-                      <Text style={styles.codeText}>
-                        features_engagement_timeslots
-                      </Text>{" "}
-                      using an engagement rate:
-                    </Text>
-                    <View style={styles.formulaWrapper}>
-                      <Text style={styles.mathFormula}>
-                        engagement_rate = (likes + comments + 0.5·saves + 0.2·shares) / impressions
-                      </Text>
-                    </View>
-                  </View>
-                </View>
-
-                {/* Step 2 */}
-                <View style={styles.mathStep}>
-                  <Text style={styles.mathStepLabel}>2.</Text>
-                  <View style={styles.mathStepBody}>
-                    <Text style={styles.mathText}>
-                      We normalize this per user with{" "}
-                      <Text style={styles.codeText}>norm_engagement()</Text>{" "}
-                      using the 10th/90th percentiles of your engagement,
-                      producing{" "}
-                      <Text style={styles.codeText}>label_engagement</Text>{" "}
-                      between 0 and 1.
-                    </Text>
-                  </View>
-                </View>
-
-                {/* Step 3 */}
-                <View style={styles.mathStep}>
-                  <Text style={styles.mathStepLabel}>3.</Text>
-                  <View style={styles.mathStepBody}>
-                    <Text style={styles.mathText}>
-                      For future hours,{" "}
-                      <Text style={styles.codeText}>
-                        get_time_segment_recommendations
-                      </Text>{" "}
-                      computes a baseline score:
-                    </Text>
-                    <View style={styles.formulaWrapper}>
-                      <Text style={styles.mathFormula}>
-                        predicted_avg = {"{label_engagement or user_recent_avg_7d or industry prior}"}
-                      </Text>
-                    </View>
-                    <Text style={styles.mathText}>
-                      Industry priors come from{" "}
-                      <Text style={styles.codeText}>global_hourly_priors</Text>,{" "}
-                      using your{" "}
-                      <Text style={styles.codeText}>
-                        brand_profiles.industry
-                      </Text>
-                      .
-                    </Text>
-                  </View>
-                </View>
-
-                {/* Step 4 */}
-                <View style={styles.mathStep}>
-                  <Text style={styles.mathStepLabel}>4.</Text>
-                  <View style={styles.mathStepBody}>
-                    <Text style={styles.mathText}>
-                      We then mix in feedback from your historical posting
-                      experiments using{" "}
-                      <Text style={styles.codeText}>bandit_rewards</Text> and{" "}
-                      <Text style={styles.codeText}>v_bandit_params</Text>:
-                    </Text>
-                    <View style={styles.formulaWrapper}>
-                      <Text style={styles.mathFormula}>
-                        final_score = 0.7 · predicted_avg + 0.3 · α / (α + β)
-                      </Text>
-                    </View>
-                    <Text style={styles.mathText}>
-                      The “Score” shown above is this{" "}
-                      <Text style={styles.codeText}>final_score</Text>, scaled
-                      to 0–100%. Higher means a better predicted hour to post
-                      relative to your own historic performance.
-                    </Text>
-                  </View>
-                </View>
-              </View>
-            )}
-          </>
-        )}
-      </View>
-
-      {/* Engagement Graph */}
-      <Text style={styles.sectionTitle}>Engagement (Last 7 days)</Text>
-      <View style={styles.card}>
-        {!hasTrendData ? (
-          <Text style={{ color: MUTED, fontSize: 12 }}>
-            No engagement data yet for the last 7 days.
-          </Text>
-        ) : (
-          <View style={styles.analyticsGraph}>
-            <View style={styles.analyticsBarsRow}>
-              {engagementTrend.series.map((d) => (
-                <View key={d.key} style={styles.analyticsBarContainer}>
-                  <View
-                    style={[
-                      styles.analyticsBar,
-                      {
-                        height: graphBarHeight(
-                          d.value,
-                          engagementTrend.maxVal
-                        ),
-                      },
-                    ]}
-                  />
-                  <Text style={styles.analyticsBarLabel}>
-                    {d.label.slice(0, 3)}
-                  </Text>
-                </View>
-              ))}
-            </View>
+        {smartPlanLoading && !smartPlan && (
+          <View
+            style={{
+              marginTop: 12,
+              flexDirection: "row",
+              alignItems: "center",
+            }}
+          >
+            <ActivityIndicator />
+            <Text style={{ marginLeft: 8, color: MUTED, fontSize: 13 }}>
+              Analysing your data and building a 7-day plan…
+            </Text>
           </View>
         )}
-      </View>
 
-      
-      {/* Top Posts (Last 30 days) */}
-      <Text style={styles.sectionTitle}>Top Posts (Last 30 days)</Text>
-      <View style={styles.card}>
-        {combinedStatsLast30.length === 0 ? (
-          <Text style={{ color: MUTED, fontSize: 12 }}>
-            No analytics yet. Publish or sync some posts to see insights (app
-            + manual Facebook posts).
+        {!smartPlanLoading && (!smartPlan || smartPlan.length === 0) && (
+          <Text style={styles.emptyText}>
+            Tap “Generate Plan” to see your recommended 7-day content schedule,
+            including formats, angles, and suggested captions.
           </Text>
-        ) : (
-          (() => {
-            const sorted = [...combinedStatsLast30]
-              .sort((a, b) => b.engagement - a.engagement)
-              .slice(0, 5);
-            const maxEng = sorted[0]?.engagement || 1;
+        )}
 
-            return sorted.map((p, idx) => {
-              const shortCaption =
-                p.caption.length > 24
-                  ? p.caption.slice(0, 24) + "…"
-                  : p.caption || "(no caption)";
-              const labelPrefix =
-                p.source === "app" ? "FB • App" : "FB • Manual";
-
-              const engRate =
-                p.impressions > 0
-                  ? (p.engagement / p.impressions) * 100
-                  : 0;
+        {!smartPlanLoading && smartPlan && smartPlan.length > 0 && (
+          <View style={styles.planList}>
+            {smartPlan.map((slot) => {
+              const dt = new Date(slot.timeslot);
+              const dayLabel = dt.toLocaleDateString(undefined, {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+              });
+              const timeLabel = dt.toLocaleTimeString(undefined, {
+                hour: "numeric",
+                minute: "2-digit",
+              });
 
               return (
-                <View key={p.objectId} style={{ marginBottom: 10 }}>
-                  <Text style={styles.perfLabel}>
-                    {idx + 1}. {labelPrefix} • {shortCaption}
-                  </Text>
-                  <View style={styles.perfTrack}>
-                    <View
-                      style={[
-                        styles.perfFill,
-                        {
-                          width: barWidthPct(p.engagement, maxEng),
-                        },
-                      ]}
-                    />
+                <View key={slot.slot_index} style={styles.planItem}>
+                  <View style={styles.planItemHeaderRow}>
+                    <Text style={styles.planItemDay}>{dayLabel}</Text>
+                    <Text style={styles.planItemTime}>{timeLabel}</Text>
                   </View>
-                  <Text style={styles.perfMeta}>
-                    Engagement: {formatNumber(p.engagement)} • Impressions:{" "}
-                    {formatNumber(p.impressions)} • Eng. rate:{" "}
-                    {engRate.toFixed(1)}%
-                  </Text>
+
+                  <View style={styles.chipRow}>
+                    <View style={styles.chipPrimary}>
+                      <Text style={styles.chipPrimaryText}>
+                        {slot.content_type.toUpperCase()}
+                      </Text>
+                    </View>
+                    <View style={styles.chip}>
+                      <Text style={styles.chipText}>
+                        Objective: {slot.objective}
+                      </Text>
+                    </View>
+                    <View style={styles.chip}>
+                      <Text style={styles.chipText}>Angle: {slot.angle}</Text>
+                    </View>
+                    {slot.segment_name && (
+                      <View style={styles.chipMuted}>
+                        <Text style={styles.chipMutedText}>
+                          Segment: {slot.segment_name}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {slot.brief && (
+                    <View style={{ marginTop: 8 }}>
+                      <Text style={styles.briefLabel}>Hook</Text>
+                      <Text style={styles.briefText}>{slot.brief.hook}</Text>
+
+                      <Text style={styles.briefLabel}>Caption idea</Text>
+                      <Text style={styles.briefText} numberOfLines={3}>
+                        {slot.brief.caption}
+                      </Text>
+
+                      <Text style={styles.briefLabel}>CTA</Text>
+                      <Text style={styles.briefText}>{slot.brief.cta}</Text>
+
+                      <Text style={styles.briefLabel}>Suggested visual</Text>
+                      <Text style={styles.briefText}>
+                        {slot.brief.visual_idea}
+                      </Text>
+                    </View>
+                  )}
                 </View>
               );
-            });
-          })()
+            })}
+          </View>
         )}
       </View>
 
-      {/* Recent Posts (App-created only) */}
-      <Text style={styles.sectionTitle}>Recent Posts (Created in Prism)</Text>
-      {recentPosts.map((p) => (
-        <TouchableOpacity
-          key={p.id}
-          style={styles.postCard}
-          activeOpacity={0.85}
-        >
-          <View style={styles.rowBetween}>
-            <View style={styles.row}>
-              {p.platforms.length > 0 && (
-                <View
-                  style={[
-                    styles.statusPill,
-                    styles.pillFB,
-                    { marginRight: 6 },
-                  ]}
-                >
-                  <Text style={styles.pillText}>FB</Text>
-                </View>
-              )}
-            </View>
-            <View
-              style={[
-                styles.statusPill,
-                p.status === "Published"
-                  ? styles.pillPublished
-                  : p.status === "Scheduled"
-                  ? styles.pillScheduled
-                  : styles.pillDraft,
-              ]}
-            >
-              <Text style={styles.pillText}>{p.status}</Text>
-            </View>
-          </View>
-          <Text style={styles.postCaption}>{p.caption}</Text>
-          <Text style={styles.postDate}>{p.date.toLocaleDateString()}</Text>
-          {p.impressions > 0 && (
-            <Text style={styles.postMeta}>
-              Impressions: {formatNumber(p.impressions)} • Eng. rate:{" "}
-              {p.engRate.toFixed(1)}%
-            </Text>
-          )}
-        </TouchableOpacity>
-      ))}
+      {/* Smart Recommendations (Thompson Sampling) */}
+      <SmartRecommendationsCard />
+
+      {/* Analytics (KPIs, trends, top posts, recent posts) */}
+      <AnalyticsSection
+        posts={posts}
+        sched={sched}
+        analytics={analytics}
+        externalPosts={externalPosts}
+        dailyEng={dailyEng}
+      />
     </ScrollView>
   );
 }
@@ -1162,240 +1298,143 @@ const styles = StyleSheet.create({
   title: { fontSize: 22, fontWeight: "700", color: TEXT },
   subtitle: { color: MUTED, fontSize: 13 },
 
-  card: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    padding: 14,
+  /* Smart Plan section */
+  section: {
     marginHorizontal: 16,
     marginBottom: 16,
-    borderWidth: 1,
-    borderColor: BORDER,
+    padding: 16,
+    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
+    shadowColor: "#000",
+    shadowOpacity: 0.04,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 1,
   },
-  rowBetween: {
+  sectionHeaderRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
-  },
-  row: { flexDirection: "row", alignItems: "center", gap: 6 },
-  cardTitle: { fontSize: 16, fontWeight: "700", color: TEXT },
-  cardHint: { color: MUTED, fontSize: 12 },
-
-  kpiRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 10,
-    marginHorizontal: 16,
+    alignItems: "flex-start",
     marginBottom: 8,
   },
-  kpiCard: {
-    width: "47.5%",
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: BORDER,
+  sectionHeaderActions: {
+    alignItems: "flex-end",
   },
-  kpiValue: { fontSize: 18, fontWeight: "800", color: TEXT },
-  kpiLabel: { color: MUTED, fontSize: 12, marginTop: 2 },
-  kpiHint: { color: "#9CA3AF", fontSize: 11, marginTop: 2 },
-
   sectionTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: TEXT,
-    marginHorizontal: 16,
-    marginVertical: 8,
-  },
-
-  // Smart recs mini calendar
-  recDayCell: {
-    width: 90,
-    padding: 8,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#F9FAFB",
-    marginRight: 10,
-  },
-  recDayToday: {
-    backgroundColor: "#E0F2FE",
-    borderColor: "#38BDF8",
-  },
-  recDayLabel: { fontSize: 11, color: MUTED, textAlign: "center" },
-  recDayLabelToday: { color: "#0369A1" },
-  recDayNumber: {
     fontSize: 18,
-    fontWeight: "700",
-    color: TEXT,
-    textAlign: "center",
-    marginTop: 2,
-  },
-  recDayNumberToday: { color: "#0284C7" },
-  recDayNoData: {
-    fontSize: 10,
-    color: MUTED,
-    textAlign: "center",
-    marginTop: 6,
-  },
-  recSlotRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginTop: 2,
-  },
-  recSlotTime: {
-    fontSize: 11,
-    color: "#111827",
-  },
-  recSlotScore: {
-    fontSize: 11,
-    color: "#0EA5E9",
     fontWeight: "600",
+    color: TEXT,
   },
-
-  // Explanation toggle
-  mathToggleRow: {
-    marginTop: 16,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-
-  // Math explanation box
-  mathBox: {
-    marginTop: 10,
-    padding: 12,
-    borderRadius: 14,
-    backgroundColor: "#F3F4FF",
-    borderWidth: 1,
-    borderColor: "#E0E7FF",
-  },
-  mathTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#111827",
-  },
-  mathText: {
-    fontSize: 11,
-    color: "#4B5563",
+  sectionSubtitle: {
+    fontSize: 12,
+    color: MUTED,
     marginTop: 2,
   },
-  mathFormula: {
-    fontSize: 16,
-    color: "#111827",
-    fontFamily: Platform.select({
-      ios: "Times New Roman",
-      android: "serif",
-      default: "serif",
-    }),
-    textAlign: "center",
+  primaryButton: {
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    backgroundColor: "#2563EB",
+    marginBottom: 6,
   },
-  codeText: {
-    fontFamily: "monospace",
+  primaryButtonText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#FFFFFF",
   },
-  mathStep: {
-    flexDirection: "row",
-    marginTop: 8,
-  },
-  mathStepLabel: {
-    fontSize: 11,
-    fontWeight: "700",
-    color: TEXT,
-    width: 18,
-  },
-  mathStepBody: {
-    flex: 1,
-  },
-  formulaWrapper: {
-    marginTop: 6,
-    marginBottom: 4,
-    paddingVertical: 6,
-    paddingHorizontal: 8,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  infoButton: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
+  ghostButton: {
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
     borderWidth: 1,
     borderColor: "#CBD5F5",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#EEF2FF",
   },
-  infoIcon: {
-    fontSize: 13,
-    fontStyle: "italic",
-    color: "#4F46E5",
+  ghostButtonText: {
+    fontSize: 12,
     fontWeight: "600",
+    color: "#2563EB",
+  },
+  emptyText: {
+    marginTop: 8,
+    fontSize: 12,
+    color: MUTED,
   },
 
-  perfLabel: { fontSize: 13, color: TEXT, marginBottom: 4 },
-  perfTrack: { height: 8, backgroundColor: "#E5E7EB", borderRadius: 8 },
-  perfFill: { height: 8, backgroundColor: "#38BDF8", borderRadius: 8 },
-  perfMeta: { color: MUTED, fontSize: 11, marginTop: 2 },
-
-  postCard: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    padding: 14,
-    marginHorizontal: 16,
-    marginBottom: 12,
+  planList: {
+    marginTop: 10,
+  },
+  planItem: {
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: "#E5E7EB",
+    padding: 10,
+    marginBottom: 8,
+    backgroundColor: "#F9FAFB",
   },
-  postCaption: { marginTop: 4, color: "#374151", fontSize: 13 },
-  postDate: { marginTop: 4, color: MUTED, fontSize: 12 },
-  postMeta: { marginTop: 4, color: MUTED, fontSize: 11 },
-
-  statusPill: {
+  planItemHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
+  planItemDay: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: TEXT,
+  },
+  planItemTime: {
+    fontSize: 12,
+    color: MUTED,
+  },
+  chipRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 4,
+  },
+  chipPrimary: {
+    marginRight: 6,
+    marginBottom: 4,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 4,
-    borderWidth: 1,
+    backgroundColor: "#EEF2FF",
   },
-  pillText: { fontSize: 11, fontWeight: "700" },
-  pillPublished: { backgroundColor: "#DCFCE7", borderColor: "#16A34A" },
-  pillScheduled: { backgroundColor: "#DBEAFE", borderColor: "#2563EB" },
-  pillDraft: { backgroundColor: "#F3F4F6", borderColor: "#D1D5DB" },
-  pillFB: { backgroundColor: "#EFF6FF", borderColor: "#1877F2" },
-
-  analyticsGraph: {
-    height: 80,
-    justifyContent: "flex-end",
-  },
-  analyticsBarsRow: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    justifyContent: "space-between",
-    flex: 1,
-  },
-  analyticsBarContainer: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "flex-end",
-  },
-  analyticsBar: {
-    width: 10,
-    borderRadius: 8,
-    backgroundColor: "#38BDF8",
-  },
-  analyticsBarLabel: {
-    marginTop: 4,
-    fontSize: 10,
-    color: MUTED,
-  },
-
-  platformMetric: { flex: 1 },
-  pmLabel: { color: MUTED, fontSize: 11 },
-  pmValue: { color: TEXT, fontSize: 15, fontWeight: "700", marginTop: 2 },
-
-  linkText: {
-    fontSize: 12,
-    color: "#2563EB",
+  chipPrimaryText: {
+    fontSize: 11,
     fontWeight: "600",
+    color: "#312E81",
+  },
+  chip: {
+    marginRight: 6,
+    marginBottom: 4,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: "#E0F2FE",
+  },
+  chipText: {
+    fontSize: 11,
+    color: "#0F172A",
+  },
+  chipMuted: {
+    marginRight: 6,
+    marginBottom: 4,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: "#E5E7EB",
+  },
+  chipMutedText: {
+    fontSize: 11,
+    color: "#4B5563",
+  },
+  briefLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: MUTED,
+    marginTop: 4,
+  },
+  briefText: {
+    fontSize: 12,
+    color: TEXT,
   },
 });

@@ -1,0 +1,177 @@
+Industry-Specific Social Media Content Priors
+
+To seed initial content performance expectations, we propose industry-specific multipliers for different content formats, objectives, and angles. These priors reflect known social media trends on Instagram/Facebook and industry benchmarks. A value above 1.0 indicates above-average expected performance, while below 1.0 is below-average (1.0 is baseline).
+
+Restaurant
+
+Restaurants thrive on visually enticing content. Short-form video/Reels showcasing food (recipes, behind-the-scenes cooking) tend to greatly boost reach and awareness – Instagram’s algorithm heavily favors Reels, which have roughly double the reach of static posts
+brands.joinstatus.com
+. For instance, Reels in 2025 achieve ~37.9% reach rates on average
+malou.io
+, making them a top format to gain new followers and brand awareness. Educational or “how-to” angles (e.g. recipe videos) are highly engaging for restaurants, aligning with the trend that “edutainment” content is most engaging for users
+netinfluencer.com
+. Conversely, purely promotional static posts (e.g. an image announcing a discount) often see lower engagement (people tend to scroll past overt ads). However, those promo images can drive conversions (e.g. table bookings) effectively by quickly conveying the offer
+carrotcake.com
+. Testimonial content (e.g. a happy customer review) builds trust and can aid conversion, but is less likely to go viral for awareness. An FAQ post (answering common questions) is useful for follower engagement or addressing concerns, yet won’t attract much new reach. Below are suggested multipliers for Restaurant content:
+
+industry	content_type	objective	angle	prior_multiplier
+restaurant	reel	awareness	how_to	1.3 (Recipe/food prep Reels attract high reach
+malou.io
+)
+restaurant	video	engagement	how_to	1.2 (Cooking/how-to videos spur saves & comments)
+restaurant	image	engagement	promo	0.8 (Static promo ads get low engagement)
+restaurant	image	conversion	promo	1.3 (Deal/offer images drive quick action
+carrotcake.com
+)
+restaurant	video	conversion	testimonial	1.1 (Short customer testimonial video builds trust to convert)
+restaurant	image	awareness	faq	0.9 (Informational FAQ graphic has limited viral appeal)
+Cafe
+
+Cafes benefit from similar visuals as restaurants – think latte art photos and drink-making videos. Eye-catching images of coffee and café ambiance remain a staple for engagement (attractive photos get strong likes/shares
+crimsoncup.com
+). Yet short videos (e.g. a barista making a latte) and Reels offer boosted reach to new audiences, as the algorithm pushes Reels content widely
+malou.io
+. “How-to” or educational angles (brewing tips, latte art tutorials) in video form perform well for awareness/engagement, tapping into the edutainment trend. Promotional posts (daily specials, discounts) in image form can convert followers to store visits, though they typically see lower engagement. Customer testimonials or community spotlights (e.g. regular customer stories) can humanize the brand – useful for building loyalty (engagement) and trust (conversion), albeit usually moderate in reach. FAQs (e.g. “How to order custom drinks”) can drive some engagement from interested followers but won’t broadly expand reach. Suggested multipliers for Cafes:
+
+industry	content_type	objective	angle	prior_multiplier
+cafe	reel	awareness	how_to	1.3 (Coffee-making tip Reels reach new viewers
+malou.io
+)
+cafe	image	engagement	how_to	1.1 (Beautiful coffee photo with a tip gets good engagement
+crimsoncup.com
+)
+cafe	image	engagement	promo	0.8 (Promotional post like “20% off today” sees low engagement)
+cafe	image	conversion	promo	1.2 (Promo image (coupon/deal) drives foot traffic conversions)
+cafe	video	engagement	testimonial	1.1 (Video featuring a customer or barista story fosters engagement)
+cafe	image	awareness	faq	0.9 (Static FAQ (e.g. hours, Wi-Fi) is niche content for existing audience)
+Clinic
+
+Clinics (e.g. medical, dental, wellness) thrive by sharing educational content that builds credibility. Informative “how-to” or health tip posts – whether a quick explainer video or a simple graphic – tend to perform above average for engagement, as audiences value learning (financial/health sectors have seen educational posts excel
+get.rivaliq.com
+). However, audience demographics skew older, so traditional image posts (e.g. infographics or before/after photos) can actually earn strong engagement here
+blog.hootsuite.com
+. Short videos (doctor Q&A, myth-busting reels) are great for awareness (wider reach via shares), but must be done in an accessible way. Testimonials (patient success stories) are powerful for conversion – seeing real outcomes builds trust and can convince potential patients. A video testimonial or case study can thus get above-average conversion results. Pure promotional content (e.g. “$100 off laser treatment”) may come across as less engaging (audiences are cautious with medical ads), though it can prompt inquiries (conversion) among interested viewers. FAQ content (answering common patient questions) is valuable for conversion (addressing concerns before booking) and engagement (current followers appreciate clarity), but typically won’t go viral to drive awareness. Suggested multipliers for Clinics:
+
+industry	content_type	objective	angle	prior_multiplier
+clinic	video	awareness	how_to	1.2 (Doctor tips/Q&A video educates and is widely shared
+get.rivaliq.com
+)
+clinic	image	engagement	how_to	1.1 (Health tip infographics get saves & likes from patients)
+clinic	image	conversion	testimonial	1.2 (Before/after or patient testimonial image builds trust to convert)
+clinic	video	conversion	testimonial	1.3 (Patient success story video strongly convinces new patients)
+clinic	image	awareness	promo	0.9 (Generic service promo image has limited shareability)
+clinic	image	awareness	faq	0.8 (Answering clinic FAQs won’t reach far beyond existing followers)
+Ecommerce
+
+E-commerce brands benefit by showcasing products in action. Product demo videos and unboxing Reels attract high awareness – short videos that highlight product use or benefits often get more shares and interactions than static images
+commerce-ui.com
+carrotcake.com
+. This aligns with the principle that if you want broad awareness, video content often wins
+carrotcake.com
+. For engagement, educational or how-to angles work well (e.g. styling tips for a fashion item, how to use a gadget): audiences engage with useful content and this boosts brand authority. User-generated testimonial content (like a customer review or influencer using the product) can also drive engagement and build trust. When it comes to conversion, clear promotional posts tend to shine – a crisp product image with a discount or free shipping offer can prompt quick action (static ads often drive direct response effectively
+carrotcake.com
+). Reels aimed at conversion (e.g. “shop now” product videos) might reach many eyeballs, but sometimes have lower immediate conversion than targeted static ads (viewers of short videos may not click through as readily). FAQ-style content (answering shipping, sizing, or usage questions) can aid conversion by resolving doubts, though such posts are usually mid-performing in engagement. Recommendations for E-commerce:
+
+industry	content_type	objective	angle	prior_multiplier
+ecommerce	reel	awareness	how_to	1.3 (Short product demo Reel grabs attention and reach
+brands.joinstatus.com
+)
+ecommerce	video	engagement	how_to	1.2 (Tutorial/guide video with the product increases engagement)
+ecommerce	image	conversion	promo	1.3 (Static ad image with promo – e.g. sale – drives quick conversions
+carrotcake.com
+)
+ecommerce	video	conversion	testimonial	1.1 (Customer review video builds trust, aiding conversions)
+ecommerce	image	engagement	promo	0.8 (Overt sales posts see low engagement rates)
+ecommerce	reel	conversion	faq	0.9 (Reel answering product FAQs informs viewers but few immediately convert)
+Coach_Consultant
+
+For coaches and consultants (e.g. business or life coaches), educational and inspirational content is key. These personal brands do well with “how-to” or tip-based posts that demonstrate expertise – e.g. a quick video with a coaching tip or a carousel of advice. Such edutainment content often sees above-average engagement (66% of users prefer this kind of engaging educational content
+netinfluencer.com
+). Short videos (talking-head tips, motivational Reels) broaden awareness and feel personal, helping to attract new audiences. Engagement can be fostered through FAQ or Q&A angles – for instance, answering followers’ questions in posts or Live videos encourages comments and interaction. Testimonials (client success stories) are vital for conversion; a compelling testimonial (text or video) can significantly increase credibility and lead to sign-ups (conversion objective gets a boost here). Promotional posts for a service (e.g. “Sign up for my webinar”) can drive conversions especially if they include a clear CTA, but pure promo posts may see below-average likes/comments (people tend to engage less with salesy posts). Below are suggested priors:
+
+industry	content_type	objective	angle	prior_multiplier
+coach_consultant	reel	awareness	how_to	1.3 (Quick tip/insight Reel expands reach and builds brand awareness)
+coach_consultant	video	engagement	faq	1.2 (Answering audience questions on video sparks comments and saves)
+coach_consultant	image	conversion	testimonial	1.3 (Client success story quote/image strongly drives inquiries)
+coach_consultant	video	conversion	testimonial	1.2 (Video testimonial of client results convinces prospects)
+coach_consultant	image	engagement	promo	0.8 (Generic “buy my coaching” graphic sees little engagement)
+coach_consultant	image	awareness	faq	0.9 (Static FAQs about services generate limited new reach)
+Content_Creator
+
+Content creators (influencers, streamers, etc.) rely on engaging and trend-driven content. Short-form video is the bread and butter here – Reels and videos typically perform above average on both reach and interactions (over half of IG users interact with Reels weekly, underlining their engagement power
+brands.joinstatus.com
+). For awareness, creators lean into trending audio, challenges, or how-to content related to their niche (e.g. a makeup tutorial Reel for a beauty creator) – these tend to get strong algorithmic push and shares. Engagement objectives are met by personal, relatable content: for example, doing an FAQ or “AMA” with fans (often via Stories or video Q&As) drives lots of comments and loyalty. Promotional content (like sponsored posts or merch plugs) often performs below average in engagement for creators – audiences may tune out obvious ads – but such posts can convert effectively if the creator’s endorsement is trusted. Testimonials aren’t typical in the traditional sense for creators, but showcasing community feedback or reviews of the creator’s own products could aid conversion. Overall, expect the highest multipliers when creators use video/reels with entertaining or informative angles, and lower when posting static or overly promotional content. Suggested values:
+
+industry	content_type	objective	angle	prior_multiplier
+content_creator	reel	awareness	how_to	1.3 (Trendy short-form video draws huge reach and new followers
+brands.joinstatus.com
+)
+content_creator	video	engagement	faq	1.2 (Personal Q&A or “behind the scenes” video prompts high fan interaction)
+content_creator	image	engagement	promo	0.8 (Sponsored static post/ads get relatively low engagement)
+content_creator	image	conversion	promo	1.1 (Promotional post (e.g. merch drop) converts loyal followers, even if few engage)
+content_creator	reel	engagement	testimonial	1.1 (Sharing a follower’s positive feedback in a Reel boosts community trust and engagement)
+content_creator	image	awareness	testimonial	0.9 (Static post sharing a user testimonial has limited viral reach)
+Agency
+
+Agencies (marketing, creative, etc.) often target a more professional audience, so content needs to showcase expertise. How-to/Educational content is highly effective for awareness and engagement – e.g. a social media agency sharing “5 tips to improve your ad ROI” in a short infographic or video can get above-average engagement (industry data shows professional audiences are “down to learn,” with educational hashtags performing well
+get.rivaliq.com
+). Static image posts (case study graphics, tip carousels) can perform solidly here – in fact, in some B2B sectors, photo posts remain top-performing
+get.rivaliq.com
+, as they deliver quick value. Reels and videos can still help reach new clients (LinkedIn aside, on IG a well-explained tip video can expand awareness). Testimonials (client success stories) are crucial for conversion: a brief video case study or a quote from a happy client will significantly boost credibility and lead generation (hence a high multiplier for conversion objective). Promotional angles (e.g. “We offer XYZ service!”) tend to see below-average engagement – soft selling via informative content works better than blatant ads for agencies. An FAQ angle (answering common marketing questions) can drive engagement among followers and assist conversion (addressing objections), but as a post type it’s more niche. Suggested multipliers:
+
+industry	content_type	objective	angle	prior_multiplier
+agency	image	awareness	how_to	1.2 (Marketing tip graphic/infographic draws shares in industry circles)
+agency	video	engagement	how_to	1.1 (Explainer video on a strategy gets decent engagement)
+agency	image	conversion	testimonial	1.3 (Client success story post strongly convinces prospects)
+agency	video	conversion	testimonial	1.2 (Video case study builds trust, aiding conversion)
+agency	image	engagement	promo	0.8 (Direct service promotion post has low engagement)
+agency	image	awareness	faq	0.9 (Answering a niche FAQ (e.g. algorithm changes) appeals to existing followers more than new ones)
+Education
+
+Educational institutions or course providers perform best by sharing valuable educational content (fittingly!). Tips, tutorials, and behind-the-scenes looks at learning in action serve awareness and engagement well. For example, a study tip carousel or quick “how-to solve X problem” video can see above-average engagement as it provides immediate value (edutainment is king – 66% of users favor content that educates + entertains
+netinfluencer.com
+). In fact, the Education industry sees strong overall engagement on Instagram (higher than many sectors)
+blog.hootsuite.com
+, likely due to compelling student stories and informative posts. Testimonials (student/alumni success stories) are excellent for conversion – they build trust for prospective students or customers considering a course. Promo posts (like “Enroll now” or open house announcements) support conversion as well, though pure ads will have modest engagement. FAQ content (answering “How do I apply?”, “What’s the schedule?”) helps conversion by clearing doubts; as social posts these might only mildly engage existing followers, but are useful resources. Reels and videos, especially showcasing campus life or quick lessons, can broaden awareness (younger audiences respond to short videos, e.g. educational TikToks/Reels). Here are the recommended multipliers:
+
+industry	content_type	objective	angle	prior_multiplier
+education	reel	awareness	how_to	1.3 (Quick educational lesson Reel draws high reach among students)
+education	image	engagement	how_to	1.2 (Study tip/infographic post gets above-average saves & shares)
+education	image	conversion	testimonial	1.3 (Alumni success story image strongly persuades prospects)
+education	video	conversion	testimonial	1.2 (Video of student testimonial or outcome boosts inquiries)
+education	image	awareness	faq	0.9 (General FAQ post (admissions info) has limited shareability)
+education	image	engagement	promo	0.8 (Generic “Sign up now” ad post sees low engagement from followers)
+Other
+
+For industries not covered above (the “other” category), a balanced approach is used. In general, video content tends to outperform static images for reach and awareness on social media
+carrotcake.com
+brands.joinstatus.com
+, thanks to algorithms prioritizing video. Thus, if your goal is awareness, favor engaging videos or Reels with broadly appealing angles (educational, entertaining, or inspiring content). For engagement-driven posts, provide value or interaction – how-to tips, questions to the audience (FAQ style), or relatable testimonials can encourage more likes and comments. For pure conversion goals, clear promotional content or testimonials that build trust can be most effective; static images often allow quick communication of a promotional offer, which can drive action (at the cost of lower engagement)
+carrotcake.com
+. In this catch-all category, it’s wise to test and adjust, but the multipliers below reflect overall platform trends (short-form videos for awareness/engagement boost, heavy promos penalized on engagement, etc.):
+
+industry	content_type	objective	angle	prior_multiplier
+other	reel	awareness	how_to	1.2 (Reels generally have superior reach for broad content
+brands.joinstatus.com
+)
+other	video	engagement	how_to	1.1 (Videos with useful info tend to get good engagement)
+other	image	conversion	promo	1.2 (Static promo posts easily convey CTA and drive conversions
+carrotcake.com
+)
+other	image	engagement	promo	0.8 (Promotional content sees below-average engagement universally)
+other	image	awareness	testimonial	0.9 (A static testimonial is less likely to spread to new audiences)
+other	video	conversion	testimonial	1.1 (Video testimonial adds credibility, aiding conversion)
+
+Sources: These recommendations are based on social media performance research and trends. For example, Instagram Reels often double the reach of image posts
+brands.joinstatus.com
+ and are currently the most engaging content type by rate
+brands.joinstatus.com
+, which justifies higher multipliers for short videos in awareness/engagement. Educational “how-to” content is highly effective across industries (66% of consumers prefer “edutainment” from brands
+netinfluencer.com
+). By contrast, overly promotional content tends to suppress engagement (users scroll past ads)
+carrotcake.com
+. Industry benchmarks show nuances: e.g., restaurants see huge boosts from food Reels
+malou.io
+, while sectors like healthcare or finance can still perform well with informative static posts
+get.rivaliq.com
+. These priors should be a helpful starting point, to be refined with actual performance data over time.

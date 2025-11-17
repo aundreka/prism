@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   Platform,
   RefreshControl,
   ScrollView,
@@ -20,8 +21,6 @@ import {
 import { useHeaderHeight } from "@react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ensurePushReady, notify } from "@/utils/push";
-
 type DBPlatform = "facebook";
 
 type ConnectedMeta = {
@@ -29,8 +28,8 @@ type ConnectedMeta = {
   platform: DBPlatform;
   page_id: string | null;
   page_name: string | null;
-  ig_user_id: string | null; // kept in type in case other screens use it
-  ig_username?: string | null; // but not used in this UI
+  ig_user_id: string | null;
+  ig_username?: string | null;
   access_token: string;
   token_expires_at: string | null;
 };
@@ -44,18 +43,153 @@ type Industry =
   | "content_creator"
   | "agency"
   | "education"
-  | "other";
+  | "other"
+  | "influencer"
+  | "school_organization"
+  | "nonprofit"
+  | "personal_brand"
+  | "local_business"
+  | "freelancer"
+  | "service_business"
+  | "real_estate"
+  | "fitness"
+  | "beauty"
+  | "photography"
+  | "events_planner"
+  | "therapist"
+  | "law_firm"
+  | "accountant"
+  | "consulting_firm"
+  | "career_coach"
+  | "virtual_assistant"
+  | "fashion_brand"
+  | "accessories"
+  | "home_goods"
+  | "toy_store"
+  | "bookstore"
+  | "yoga_studio"
+  | "nutritionist"
+  | "spa_wellness"
+  | "mental_health"
+  | "plumber"
+  | "electrician"
+  | "cleaning_service"
+  | "landscaping"
+  | "auto_repair"
+  | "graphic_designer"
+  | "videographer"
+  | "artist"
+  | "writer"
+  | "voice_actor"
+  | "tutor"
+  | "language_school"
+  | "test_prep"
+  | "edu_creator"
+  | "saas"
+  | "web_agency"
+  | "mobile_app"
+  | "tech_startup"
+  | "it_services"
+  | "food_truck"
+  | "catering"
+  | "event_venue"
+  | "wedding_vendor"
+  | "pet_services"
+  | "travel_blog"
+  | "gaming_channel"
+  | "parenting"
+  | "diy_maker";
 
-const INDUSTRY_OPTIONS: { value: Industry; label: string }[] = [
-  { value: "content_creator", label: "Content Creator" },
-  { value: "ecommerce", label: "E-commerce / Online Shop" },
-  { value: "restaurant", label: "Restaurant / Food" },
-  { value: "cafe", label: "Café / Beverage" },
-  { value: "clinic", label: "Clinic / Health" },
-  { value: "coach_consultant", label: "Coach / Consultant" },
-  { value: "agency", label: "Agency / Services" },
-  { value: "education", label: "Education" },
-  { value: "other", label: "Other" },
+type IndustryOption = {
+  value: Industry;
+  label: string;
+  category: string;
+};
+
+const INDUSTRY_OPTIONS: IndustryOption[] = [
+  // Food & Beverage
+  { value: "restaurant", label: "Restaurant", category: "Food & Beverage" },
+  { value: "cafe", label: "Café / Beverage", category: "Food & Beverage" },
+  { value: "food_truck", label: "Food Truck", category: "Food & Beverage" },
+  { value: "catering", label: "Catering", category: "Food & Beverage" },
+
+  // Health & Wellness
+  { value: "clinic", label: "Clinic / Health", category: "Health & Wellness" },
+  { value: "fitness", label: "Fitness / Gym", category: "Health & Wellness" },
+  { value: "beauty", label: "Beauty / Aesthetics", category: "Health & Wellness" },
+  { value: "spa_wellness", label: "Spa & Wellness", category: "Health & Wellness" },
+  { value: "mental_health", label: "Mental Health", category: "Health & Wellness" },
+  { value: "nutritionist", label: "Nutritionist / Dietitian", category: "Health & Wellness" },
+  { value: "yoga_studio", label: "Yoga Studio", category: "Health & Wellness" },
+  { value: "therapist", label: "Therapist / Counseling", category: "Health & Wellness" },
+
+  // Creators & Influencers
+  { value: "influencer", label: "Influencer", category: "Creators & Influencers" },
+  { value: "content_creator", label: "Content Creator", category: "Creators & Influencers" },
+  { value: "personal_brand", label: "Personal Brand", category: "Creators & Influencers" },
+  { value: "artist", label: "Artist", category: "Creators & Influencers" },
+  { value: "writer", label: "Writer / Author", category: "Creators & Influencers" },
+  { value: "voice_actor", label: "Voice Actor", category: "Creators & Influencers" },
+  { value: "photography", label: "Photography", category: "Creators & Influencers" },
+  { value: "videographer", label: "Videographer / Filmmaker", category: "Creators & Influencers" },
+  { value: "travel_blog", label: "Travel Blogger / Vlogger", category: "Creators & Influencers" },
+  { value: "gaming_channel", label: "Gaming Channel / Streamer", category: "Creators & Influencers" },
+  { value: "parenting", label: "Parenting Creator", category: "Creators & Influencers" },
+  { value: "diy_maker", label: "DIY / Maker", category: "Creators & Influencers" },
+  { value: "edu_creator", label: "Educational Creator", category: "Creators & Influencers" },
+
+  // Education
+  { value: "education", label: "Education Business", category: "Education" },
+  { value: "school_organization", label: "School / Organization", category: "Education" },
+  { value: "tutor", label: "Tutor / Tutoring Center", category: "Education" },
+  { value: "language_school", label: "Language School", category: "Education" },
+  { value: "test_prep", label: "Test Prep / Review Center", category: "Education" },
+
+  // Professional Services & Agencies
+  { value: "coach_consultant", label: "Coach / Consultant", category: "Professional Services & Agencies" },
+  { value: "career_coach", label: "Career Coach", category: "Professional Services & Agencies" },
+  { value: "agency", label: "Marketing / Creative Agency", category: "Professional Services & Agencies" },
+  { value: "consulting_firm", label: "Consulting Firm", category: "Professional Services & Agencies" },
+  { value: "law_firm", label: "Law Firm", category: "Professional Services & Agencies" },
+  { value: "accountant", label: "Accountant / Accounting Firm", category: "Professional Services & Agencies" },
+  { value: "virtual_assistant", label: "Virtual Assistant", category: "Professional Services & Agencies" },
+  { value: "it_services", label: "IT Services", category: "Professional Services & Agencies" },
+  { value: "web_agency", label: "Web Design / Dev Agency", category: "Professional Services & Agencies" },
+  { value: "mobile_app", label: "Mobile App Business", category: "Professional Services & Agencies" },
+  { value: "tech_startup", label: "Tech Startup", category: "Professional Services & Agencies" },
+  { value: "saas", label: "SaaS Product", category: "Professional Services & Agencies" },
+
+  // Local & Home Services
+  { value: "local_business", label: "Local Business", category: "Local & Home Services" },
+  { value: "service_business", label: "Service Business", category: "Local & Home Services" },
+  { value: "plumber", label: "Plumber", category: "Local & Home Services" },
+  { value: "electrician", label: "Electrician", category: "Local & Home Services" },
+  { value: "cleaning_service", label: "Cleaning Service", category: "Local & Home Services" },
+  { value: "landscaping", label: "Landscaping / Gardening", category: "Local & Home Services" },
+  { value: "auto_repair", label: "Auto Repair / Car Care", category: "Local & Home Services" },
+  { value: "pet_services", label: "Pet Services / Grooming", category: "Local & Home Services" },
+
+  // Retail & Brands
+  { value: "ecommerce", label: "E-commerce / Online Shop", category: "Retail & Brands" },
+  { value: "fashion_brand", label: "Fashion Brand", category: "Retail & Brands" },
+  { value: "accessories", label: "Accessories / Jewelry", category: "Retail & Brands" },
+  { value: "home_goods", label: "Home Goods / Decor", category: "Retail & Brands" },
+  { value: "toy_store", label: "Toy Store", category: "Retail & Brands" },
+  { value: "bookstore", label: "Bookstore", category: "Retail & Brands" },
+
+  // Events & Venues
+  { value: "events_planner", label: "Events Planner", category: "Events & Venues" },
+  { value: "event_venue", label: "Event Venue", category: "Events & Venues" },
+  { value: "wedding_vendor", label: "Wedding Vendor", category: "Events & Venues" },
+
+  // Real Estate & Travel
+  { value: "real_estate", label: "Real Estate", category: "Real Estate & Travel" },
+
+  // Nonprofit & Community
+  { value: "nonprofit", label: "Nonprofit / NGO", category: "Nonprofit & Community" },
+
+  // Catch-all / Other
+  { value: "other", label: "Other / Not Listed", category: "Other" },
 ];
 
 type BrandProfileRow = {
@@ -137,6 +271,10 @@ export default function ProfileScreen() {
   const [brandSaving, setBrandSaving] = useState(false);
   const [isEditingBrand, setIsEditingBrand] = useState(false);
 
+  // Industry picker state
+  const [industryPickerVisible, setIndustryPickerVisible] = useState(false);
+  const [industrySearch, setIndustrySearch] = useState("");
+
   const headerHeight = useHeaderHeight();
   const insets = useSafeAreaInsets();
 
@@ -171,9 +309,6 @@ export default function ProfileScreen() {
 
   useEffect(() => {
     (async () => {
-      try {
-        await ensurePushReady?.();
-      } catch {}
       const { data } = await supabase.auth.getUser();
       const user = data?.user;
       setDisplayName(
@@ -190,7 +325,9 @@ export default function ProfileScreen() {
   }, [loadBrandProfile]);
 
   const industryLabel = useMemo(
-    () => INDUSTRY_OPTIONS.find((opt) => opt.value === industry)?.label ?? "Other",
+    () =>
+      INDUSTRY_OPTIONS.find((opt) => opt.value === industry)?.label ??
+      "Other / Not Listed",
     [industry]
   );
 
@@ -243,7 +380,8 @@ export default function ProfileScreen() {
         platform: "facebook",
         redirect_uri: REDIRECT_URI,
         pick: true,
-        redirect_override: Platform.OS === "web" ? `${OAUTH_BASE}/meta_web_close` : undefined,
+        redirect_override:
+          Platform.OS === "web" ? `${OAUTH_BASE}/meta_web_close` : undefined,
       };
 
       const resp = await fetch(`${OAUTH_BASE}/meta_connect`, {
@@ -261,28 +399,6 @@ export default function ProfileScreen() {
 
       if (res.type === "success" && res.url?.includes("ok=1")) {
         await refresh();
-
-        // 🔔 Push: Connected (Facebook only)
-        try {
-          const latest = (await supabase
-            .from("connected_meta_accounts")
-            .select("page_name,page_id")
-            .eq("platform", "facebook")
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .single()).data as any;
-
-          const pageLabel = latest?.page_name || latest?.page_id || "Facebook Page";
-          await notify?.({
-            title: "Meta account linked",
-            body: `Connected to ${pageLabel}.`,
-            data: {
-              kind: "meta_connected",
-              page_id: latest?.page_id,
-            },
-          });
-        } catch {}
-
         Alert.alert("Connected", "Meta account linked.");
       }
     } catch (e: any) {
@@ -301,15 +417,6 @@ export default function ProfileScreen() {
         .eq("id", row.id);
       if (error) throw error;
 
-      // 🔔 Push: Disconnected
-      try {
-        await notify?.({
-          title: "Meta account disconnected",
-          body: row.page_name ? `${row.page_name} has been removed.` : "Facebook Page removed.",
-          data: { kind: "meta_disconnected", id: row.id, page_id: row.page_id },
-        });
-      } catch {}
-
       await refresh();
     } catch (e: any) {
       Alert.alert("Disconnect failed", e?.message ?? "Unexpected error.");
@@ -318,266 +425,431 @@ export default function ProfileScreen() {
     }
   };
 
+  // Change Page: remove current connection, then re-run connectMeta
+  const connected = rows.length > 0;
+  const primary = rows[0] || null;
+
+  const changePage = useCallback(async () => {
+    if (!primary) {
+      // If nothing connected, just run connect flow
+      await connectMeta();
+      return;
+    }
+
+    try {
+      setWorking(primary.id);
+      const { error } = await supabase
+        .from("connected_meta_accounts")
+        .delete()
+        .eq("id", primary.id);
+      if (error) throw error;
+
+      await refresh();
+      setWorking(null);
+
+      // Start fresh connection so user can pick a different page
+      await connectMeta();
+    } catch (e: any) {
+      setWorking(null);
+      Alert.alert("Change Page failed", e?.message ?? "Unexpected error.");
+    }
+  }, [primary, refresh]);
+
   const onSignOut = async () => {
     try {
       await supabase.auth.signOut();
-
-      try {
-        await notify?.({
-          title: "Signed out",
-          body: "You’ve been signed out of PRISM.",
-          data: { kind: "signed_out" },
-        });
-      } catch {}
-
       router.replace("/(auth)");
     } catch (e: any) {
       Alert.alert("Sign out failed", e?.message ?? "Unexpected error.");
     }
   };
 
-  const connected = rows.length > 0;
-  const primary = rows[0] || null;
-
   const connectedStatus = connected ? "Connected" : "Not Connected";
   const statusBg = connected ? "#DCFCE7" : "#FEF2F2";
   const statusFg = connected ? "#166534" : "#991B1B";
 
+  // ---- Industry search + grouping ----
+  const filteredIndustryOptions = useMemo(() => {
+    const q = industrySearch.trim().toLowerCase();
+    if (!q) return INDUSTRY_OPTIONS;
+    return INDUSTRY_OPTIONS.filter((opt) => {
+      const label = opt.label.toLowerCase();
+      const value = opt.value.replace(/_/g, " ").toLowerCase();
+      return label.includes(q) || value.includes(q);
+    });
+  }, [industrySearch]);
+
+  const industryGroups = useMemo(() => {
+    const groups: Record<string, IndustryOption[]> = {};
+    filteredIndustryOptions.forEach((opt) => {
+      if (!groups[opt.category]) groups[opt.category] = [];
+      groups[opt.category].push(opt);
+    });
+    // simple sort by category name so it's stable
+    return Object.keys(groups)
+      .sort()
+      .map((key) => ({ category: key, items: groups[key] }));
+  }, [filteredIndustryOptions]);
+
+  const closeIndustryPicker = () => {
+    setIndustryPickerVisible(false);
+    setIndustrySearch("");
+  };
+
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={[
-        styles.content,
-        {
-          paddingTop: headerHeight,
-          paddingBottom: insets.bottom + 24,
-        },
-      ]}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-    >
-      {/* ---------- HEADER ---------- */}
-      <View style={styles.hero}>
-        <View style={styles.heroTopRow}>
-          <TouchableOpacity onPress={onSignOut} style={styles.signOutBtn} activeOpacity={0.85}>
-            <Text style={styles.signOutText}>Sign out</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.heroBody}>
-          <View style={styles.avatar}>
-            <Text style={styles.avatarText}>{avatarText}</Text>
+    <>
+      <ScrollView
+        style={styles.container}
+        contentContainerStyle={[
+          styles.content,
+          {
+            paddingTop: headerHeight,
+            paddingBottom: insets.bottom + 24,
+          },
+        ]}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+      >
+        {/* ---------- HEADER ---------- */}
+        <View style={styles.hero}>
+          <View style={styles.heroTopRow}>
+            <TouchableOpacity onPress={onSignOut} style={styles.signOutBtn} activeOpacity={0.85}>
+              <Text style={styles.signOutText}>Sign out</Text>
+            </TouchableOpacity>
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.userName} numberOfLines={1}>
-              {userTag}
-            </Text>
-            {email ? (
-              <Text style={styles.userEmail} numberOfLines={1}>
-                {email}
-              </Text>
-            ) : null}
-            <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
-              <View
-                style={[
-                  styles.dot,
-                  { backgroundColor: connected ? "#22C55E" : "#EF4444" },
-                ]}
-              />
-              <Text style={[styles.statusText, { color: statusFg }]}>{connectedStatus}</Text>
+
+          <View style={styles.heroBody}>
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>{avatarText}</Text>
             </View>
-          </View>
-        </View>
-      </View>
-
-      {/* ---------- BODY ---------- */}
-      <View style={styles.body}>
-        {/* Brand Profile Card */}
-        
-        <View style={styles.profilecard}>
-          <View style={styles.cardHeaderRow}>
             <View style={{ flex: 1 }}>
-              <Text style={styles.cardTitle}>Brand Profile</Text>
-            </View>
-            <TouchableOpacity
-              onPress={() => setIsEditingBrand((v) => !v)}
-              style={styles.editPill}
-              activeOpacity={0.9}
-              disabled={brandLoading || brandSaving || !userId}
-            >
-              <Text style={styles.editPillText}>
-                {isEditingBrand ? "Done" : brandName || industry ? "Edit" : "Set up"}
+              <Text style={styles.userName} numberOfLines={1}>
+                {userTag}
               </Text>
-            </TouchableOpacity>
-          </View>
-
-          {brandLoading ? (
-            <View style={[styles.rowCenter, { marginTop: 12 }]}>
-              <ActivityIndicator />
-              <Text style={{ marginLeft: 8, color: "#6B7280", fontSize: 13 }}>Loading…</Text>
-            </View>
-          ) : (
-            <>
-              {/* Minimal summary view (always visible) */}
-              <View style={styles.summaryRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.summaryLabel}>Brand name</Text>
-                  <Text style={styles.summaryValue}>
-                    {brandName.trim() || "Not set"}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={[styles.summaryRow, { marginTop: 8 }]}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.summaryLabel}>Industry</Text>
-                  <Text style={styles.summaryValue}>{industryLabel}</Text>
-                </View>
-              </View>
-
-              {/* Editable controls only when editing */}
-              {isEditingBrand && (
-                <>
-                  <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Brand name</Text>
-                  <TextInput
-                    value={brandName}
-                    onChangeText={setBrandName}
-                    placeholder="e.g. Salus Skin & Wellness Clinic"
-                    placeholderTextColor="#9CA3AF"
-                    style={styles.textInput}
-                    editable={!brandLoading && !brandSaving}
-                  />
-
-                  <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Industry</Text>
-                  <View style={styles.chipRow}>
-                    {INDUSTRY_OPTIONS.map((opt) => {
-                      const selected = industry === opt.value;
-                      return (
-                        <TouchableOpacity
-                          key={opt.value}
-                          style={[styles.chip, selected && styles.chipSelected]}
-                          onPress={() => setIndustry(opt.value)}
-                          activeOpacity={0.9}
-                          disabled={brandSaving}
-                        >
-                          <Text
-                            style={[
-                              styles.chipText,
-                              selected && styles.chipTextSelected,
-                            ]}
-                          >
-                            {opt.label}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-
-                  <TouchableOpacity
-                    onPress={saveBrandProfile}
-                    style={[
-                      styles.primaryBtn,
-                      (brandSaving || brandLoading || !userId) && styles.btnDisabled,
-                      { marginTop: 16 },
-                    ]}
-                    activeOpacity={0.92}
-                    disabled={brandSaving || brandLoading || !userId}
-                  >
-                    {brandSaving ? (
-                      <View style={styles.rowCenter}>
-                        <ActivityIndicator />
-                        <Text style={[styles.primaryBtnText, { marginLeft: 8 }]}>Saving…</Text>
-                      </View>
-                    ) : (
-                      <Text style={styles.primaryBtnText}>Save Brand Profile</Text>
-                    )}
-                  </TouchableOpacity>
-                </>
-              )}
-            </>
-          )}
-        </View>
-
-        {/* Meta Connection Card */}
-        {!connected ? (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Connect your Meta account</Text>
-            <Text style={styles.cardSubtle}>
-              Choose a Facebook Page to connect. We’ll use its analytics to power your
-              recommendations.
-            </Text>
-
-            <TouchableOpacity
-              onPress={connectMeta}
-              style={[styles.primaryBtn, connecting && styles.btnDisabled]}
-              activeOpacity={0.92}
-              disabled={connecting}
-            >
-              {connecting ? (
-                <View style={styles.rowCenter}>
-                  <ActivityIndicator />
-                  <Text style={[styles.primaryBtnText, { marginLeft: 8 }]}>Connecting…</Text>
-                </View>
-              ) : (
-                <Text style={styles.primaryBtnText}>Connect Meta Account</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        ) : (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Linked Accounts</Text>
-
-            <View style={styles.itemRow}>
-              <View style={styles.itemIconWrap}>
-                <FontAwesome name="facebook-square" size={20} color="#1877F2" />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.itemLabel}>Facebook Page</Text>
-                <Text style={styles.itemValue}>
-                  {primary?.page_name || primary?.page_id || "—"}
+              {email ? (
+                <Text style={styles.userEmail} numberOfLines={1}>
+                  {email}
+                </Text>
+              ) : null}
+              <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
+                <View
+                  style={[
+                    styles.dot,
+                    { backgroundColor: connected ? "#22C55E" : "#EF4444" },
+                  ]}
+                />
+                <Text style={[styles.statusText, { color: statusFg }]}>
+                  {connectedStatus}
                 </Text>
               </View>
             </View>
+          </View>
+        </View>
 
-            <View style={styles.inlineRow}>
+        {/* ---------- BODY ---------- */}
+        <View style={styles.body}>
+          {/* Brand Profile Card */}
+          <View style={styles.profilecard}>
+            <View style={styles.cardHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.cardTitle}>Brand Profile</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setIsEditingBrand((v) => !v)}
+                style={styles.editPill}
+                activeOpacity={0.9}
+                disabled={brandLoading || brandSaving || !userId}
+              >
+                <Text style={styles.editPillText}>
+                  {isEditingBrand ? "Done" : brandName || industry ? "Edit" : "Set up"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {brandLoading ? (
+              <View style={[styles.rowCenter, { marginTop: 12 }]}>
+                <ActivityIndicator />
+                <Text style={{ marginLeft: 8, color: "#6B7280", fontSize: 13 }}>
+                  Loading…
+                </Text>
+              </View>
+            ) : (
+              <>
+                {/* Minimal summary view (always visible) */}
+                <View style={styles.summaryRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.summaryLabel}>Brand name</Text>
+                    <Text style={styles.summaryValue}>
+                      {brandName.trim() || "Not set"}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={[styles.summaryRow, { marginTop: 8 }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.summaryLabel}>Industry</Text>
+                    <Text style={styles.summaryValue}>{industryLabel}</Text>
+                  </View>
+                </View>
+
+                {/* Editable controls only when editing */}
+                {isEditingBrand && (
+                  <>
+                    <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Brand name</Text>
+                    <TextInput
+                      value={brandName}
+                      onChangeText={setBrandName}
+                      placeholder="e.g. Salus Skin & Wellness Clinic"
+                      placeholderTextColor="#9CA3AF"
+                      style={styles.textInput}
+                      editable={!brandLoading && !brandSaving}
+                    />
+
+                    <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Industry</Text>
+                    <TouchableOpacity
+                      style={styles.selectField}
+                      onPress={() => setIndustryPickerVisible(true)}
+                      activeOpacity={0.9}
+                      disabled={brandSaving}
+                    >
+                      <Text
+                        style={
+                          industry
+                            ? styles.selectFieldText
+                            : styles.selectFieldPlaceholder
+                        }
+                        numberOfLines={1}
+                      >
+                        {industryLabel}
+                      </Text>
+                      <FontAwesome
+                        name="chevron-right"
+                        size={14}
+                        color="#9CA3AF"
+                        style={{ marginLeft: 8 }}
+                      />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      onPress={saveBrandProfile}
+                      style={[
+                        styles.primaryBtn,
+                        (brandSaving || brandLoading || !userId) && styles.btnDisabled,
+                        { marginTop: 16 },
+                      ]}
+                      activeOpacity={0.92}
+                      disabled={brandSaving || brandLoading || !userId}
+                    >
+                      {brandSaving ? (
+                        <View style={styles.rowCenter}>
+                          <ActivityIndicator />
+                          <Text
+                            style={[styles.primaryBtnText, { marginLeft: 8 }]}
+                          >
+                            Saving…
+                          </Text>
+                        </View>
+                      ) : (
+                        <Text style={styles.primaryBtnText}>Save Brand Profile</Text>
+                      )}
+                    </TouchableOpacity>
+                  </>
+                )}
+              </>
+            )}
+          </View>
+
+          {/* Meta Connection Card */}
+          {!connected ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Connect your Meta account</Text>
+              <Text style={styles.cardSubtle}>
+                Choose a Facebook Page to connect. We’ll use its analytics to power your
+                recommendations.
+              </Text>
+
               <TouchableOpacity
                 onPress={connectMeta}
-                style={[styles.secondaryBtn, (connecting || working) && styles.btnDisabled]}
+                style={[styles.primaryBtn, connecting && styles.btnDisabled]}
                 activeOpacity={0.92}
-                disabled={!!(connecting || working)}
+                disabled={connecting}
               >
                 {connecting ? (
                   <View style={styles.rowCenter}>
                     <ActivityIndicator />
-                    <Text style={[styles.secondaryBtnText, { marginLeft: 8 }]}>Opening…</Text>
+                    <Text style={[styles.primaryBtnText, { marginLeft: 8 }]}>
+                      Connecting…
+                    </Text>
                   </View>
                 ) : (
-                  <Text style={styles.secondaryBtnText}>Change Page</Text>
-                )}
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                onPress={() => disconnect(primary!)}
-                style={[
-                  styles.ghostDanger,
-                  (working === primary?.id || connecting) && styles.btnDisabled,
-                ]}
-                activeOpacity={0.92}
-                disabled={working === primary?.id || connecting}
-              >
-                {working === primary?.id ? (
-                  <View style={styles.rowCenter}>
-                    <ActivityIndicator />
-                    <Text style={[styles.ghostDangerText, { marginLeft: 8 }]}>Removing…</Text>
-                  </View>
-                ) : (
-                  <Text style={styles.ghostDangerText}>Disconnect</Text>
+                  <Text style={styles.primaryBtnText}>Connect Meta Account</Text>
                 )}
               </TouchableOpacity>
             </View>
+          ) : (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Linked Accounts</Text>
+
+              <View style={styles.itemRow}>
+                <View style={styles.itemIconWrap}>
+                  <FontAwesome name="facebook-square" size={20} color="#1877F2" />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.itemLabel}>Facebook Page</Text>
+                  <Text style={styles.itemValue}>
+                    {primary?.page_name || primary?.page_id || "—"}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.inlineRow}>
+                <TouchableOpacity
+                  onPress={changePage}
+                  style={[
+                    styles.secondaryBtn,
+                    (connecting || working) && styles.btnDisabled,
+                  ]}
+                  activeOpacity={0.92}
+                  disabled={!!(connecting || working)}
+                >
+                  {connecting ? (
+                    <View style={styles.rowCenter}>
+                      <ActivityIndicator />
+                      <Text
+                        style={[styles.secondaryBtnText, { marginLeft: 8 }]}
+                      >
+                        Opening…
+                      </Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.secondaryBtnText}>Change Page</Text>
+                  )}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  onPress={() => disconnect(primary!)}
+                  style={[
+                    styles.ghostDanger,
+                    (working === primary?.id || connecting) && styles.btnDisabled,
+                  ]}
+                  activeOpacity={0.92}
+                  disabled={working === primary?.id || connecting}
+                >
+                  {working === primary?.id ? (
+                    <View style={styles.rowCenter}>
+                      <ActivityIndicator />
+                      <Text
+                        style={[styles.ghostDangerText, { marginLeft: 8 }]}
+                      >
+                        Removing…
+                      </Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.ghostDangerText}>Disconnect</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+        </View>
+      </ScrollView>
+
+      {/* ---------- INDUSTRY PICKER MODAL (fullscreen-ish) ---------- */}
+      <Modal
+        visible={industryPickerVisible}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={closeIndustryPicker}
+      >
+        <View
+          style={[
+            styles.modalContainer,
+            { paddingTop: insets.top + 12 },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <TouchableOpacity
+              onPress={closeIndustryPicker}
+              style={styles.modalClose}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.modalCloseText}>Cancel</Text>
+            </TouchableOpacity>
+            <Text style={styles.modalTitle}>Choose your industry</Text>
+            <View style={{ width: 60 }} />{/* spacer */}
           </View>
-        )}
-      </View>
-    </ScrollView>
+
+          <View style={styles.searchWrapper}>
+            <FontAwesome
+              name="search"
+              size={14}
+              color="#9CA3AF"
+              style={{ marginRight: 6 }}
+            />
+            <TextInput
+              value={industrySearch}
+              onChangeText={setIndustrySearch}
+              placeholder="Search industries…"
+              placeholderTextColor="#9CA3AF"
+              style={styles.searchInput}
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+          </View>
+
+          <ScrollView
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24 }}
+          >
+            {industryGroups.length === 0 ? (
+              <View style={styles.noResults}>
+                <Text style={styles.noResultsText}>
+                  No industries found. Try a different keyword.
+                </Text>
+              </View>
+            ) : (
+              industryGroups.map((group) => (
+                <View key={group.category} style={styles.groupSection}>
+                  <Text style={styles.groupHeaderText}>{group.category}</Text>
+                  {group.items.map((opt) => {
+                    const selected = opt.value === industry;
+                    return (
+                      <TouchableOpacity
+                        key={opt.value}
+                        style={[
+                          styles.industryOptionRow,
+                          selected && styles.industryOptionSelected,
+                        ]}
+                        activeOpacity={0.85}
+                        onPress={() => {
+                          setIndustry(opt.value);
+                          closeIndustryPicker();
+                        }}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.industryOptionLabel}>
+                            {opt.label}
+                          </Text>
+                          <Text style={styles.industryOptionSlug}>
+                            {opt.value.replace(/_/g, " ")}
+                          </Text>
+                        </View>
+                        {selected && (
+                          <FontAwesome
+                            name="check"
+                            size={16}
+                            color="#111827"
+                          />
+                        )}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              ))
+            )}
+          </ScrollView>
+        </View>
+      </Modal>
+    </>
   );
 }
 
@@ -750,32 +1022,7 @@ const styles = StyleSheet.create({
     color: TEXT_DARK,
     backgroundColor: "#F9FAFB",
   },
-  chipRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    marginTop: 8,
-  },
-  chip: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#F9FAFB",
-  },
-  chipSelected: {
-    backgroundColor: "#111827",
-    borderColor: "#111827",
-  },
-  chipText: {
-    fontSize: 12,
-    color: TEXT_MUTED,
-    fontWeight: "600",
-  },
-  chipTextSelected: {
-    color: "#F9FAFB",
-  },
+
   summaryRow: {
     marginTop: 14,
     paddingVertical: 4,
@@ -791,5 +1038,119 @@ const styles = StyleSheet.create({
     color: TEXT_DARK,
     fontWeight: "700",
     marginTop: 2,
+  },
+
+  // Industry select
+  selectField: {
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: "#F9FAFB",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  selectFieldText: {
+    flex: 1,
+    fontSize: 14,
+    color: TEXT_DARK,
+    fontWeight: "600",
+  },
+  selectFieldPlaceholder: {
+    flex: 1,
+    fontSize: 14,
+    color: "#9CA3AF",
+  },
+
+  // Modal
+  modalContainer: {
+    flex: 1,
+    backgroundColor: "#F9FAFB",
+    paddingHorizontal: 16,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: TEXT_DARK,
+  },
+  modalClose: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    minWidth: 60,
+  },
+  modalCloseText: {
+    fontSize: 13,
+    color: "#6B7280",
+  },
+  searchWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: TEXT_DARK,
+  },
+  groupSection: {
+    marginTop: 14,
+  },
+  groupHeaderText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#6B7280",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginBottom: 6,
+  },
+  industryOptionRow: {
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#FFFFFF",
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+  industryOptionSelected: {
+    borderColor: "#111827",
+    backgroundColor: "#F3F4F6",
+  },
+  industryOptionLabel: {
+    fontSize: 14,
+    color: TEXT_DARK,
+    fontWeight: "600",
+  },
+  industryOptionSlug: {
+    fontSize: 11,
+    color: "#9CA3AF",
+    marginTop: 2,
+    textTransform: "lowercase",
+  },
+  noResults: {
+    marginTop: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noResultsText: {
+    fontSize: 13,
+    color: "#9CA3AF",
   },
 });

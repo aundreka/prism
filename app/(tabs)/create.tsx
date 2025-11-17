@@ -7,7 +7,7 @@ import * as ExpoCrypto from "expo-crypto";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
-import { router, useLocalSearchParams } from "expo-router"; // ⬅️ UPDATED
+import { router, useLocalSearchParams } from "expo-router";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -25,6 +25,16 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
+/* -------------------------
+   Angles config
+--------------------------*/
+import {
+  ANGLE_CATEGORIES,
+  AngleKey,
+  getAngleByKey,
+  getSuggestedAnglesForIndustry,
+} from "@/config/angles";
 
 /* -------------------------
    Config
@@ -64,6 +74,13 @@ function fileExtFromUri(uri: string) {
   const q = uri.split("?")[0];
   const m = q.match(/\.(\w+)(?:$|#)/);
   return m ? m[1].toLowerCase() : "jpg";
+}
+function prettyIndustryLabel(ind?: string | null) {
+  if (!ind) return "";
+  return ind
+    .split("_")
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
 }
 
 /* -------------------------
@@ -144,27 +161,62 @@ type PostStatusEnum =
   | "failed"
   | "canceled";
 
+// enums for objective (angle comes from config)
+type ObjectiveEnum = "awareness" | "engagement" | "conversion";
+
 type ConnectedMeta = {
   id: string;
   user_id: string;
   platform: PlatformEnum;
   page_id: string | null;
   page_name: string | null;
-  ig_user_id: string | null; // still in DB, but ignored in UI
-  ig_username: string | null; // still in DB, but ignored in UI
+  ig_user_id: string | null;
+  ig_username: string | null;
   access_token: string;
   token_expires_at: string | null;
 };
 
 /* -------------------------
+   Objective option metadata
+--------------------------*/
+const OBJECTIVE_OPTIONS: {
+  key: ObjectiveEnum;
+  label: string;
+  subtitle: string;
+}[] = [
+  {
+    key: "awareness",
+    label: "Awareness",
+    subtitle: "Reach more people / views",
+  },
+  {
+    key: "engagement",
+    label: "Engagement",
+    subtitle: "Likes, comments, saves",
+  },
+  {
+    key: "conversion",
+    label: "Sales / Conversion",
+    subtitle: "Clicks, inquiries, purchases",
+  },
+];
+
+/* -------------------------
    Main Screen
 --------------------------*/
 export default function CreateScreen() {
-  // ⬇️ read params from calendar
+  // ⬇️ read params from calendar AND drafts
   const params = useLocalSearchParams<{
     mode?: string | string[];
     scheduled_at?: string | string[];
+    draft_id?: string | string[];
   }>();
+
+  const draftId = useMemo(() => {
+    const raw = params.draft_id;
+    const id = Array.isArray(raw) ? raw[0] : raw;
+    return typeof id === "string" ? id : null;
+  }, [params]);
 
   const initialScheduledDate = useMemo(() => {
     const rawMode = params.mode;
@@ -173,18 +225,21 @@ export default function CreateScreen() {
     const mode = Array.isArray(rawMode) ? rawMode[0] : rawMode;
     const schedStr = Array.isArray(rawSched) ? rawSched[0] : rawSched;
 
-    if (mode === "schedule" && typeof schedStr === "string") {
+    if (mode === "schedule" && typeof schedStr === "string" && !draftId) {
       const d = new Date(schedStr);
       if (!isNaN(d.getTime())) {
         return d;
       }
     }
     return null;
-  }, [params]);
+  }, [params, draftId]);
 
   const [uid, setUid] = useState<string | null>(null);
   const [connections, setConnections] = useState<ConnectedMeta[]>([]);
   const [loadingConn, setLoadingConn] = useState(true);
+
+  // brand industry (from brand_profiles)
+  const [industry, setIndustry] = useState<string | null>(null);
 
   const [caption, setCaption] = useState("");
   const [mediaLocal, setMediaLocal] = useState<
@@ -206,7 +261,32 @@ export default function CreateScreen() {
   const schedKey = initialScheduledDate
     ? initialScheduledDate.getTime()
     : null;
-  const [ignoredParamKey, setIgnoredParamKey] = useState<number | null>(null);
+  const [ignoredParamKey, setIgnoredParamKey] = useState<number | null>(
+    null
+  );
+
+  // objective + angle state
+  const [objective, setObjective] = useState<ObjectiveEnum>("awareness");
+  const [angle, setAngle] = useState<AngleKey>("how_to");
+
+  // angle modal + search
+  const [angleModalVisible, setAngleModalVisible] = useState(false);
+  const [angleSearch, setAngleSearch] = useState("");
+
+  // Single-video mode toggle
+  const [videoPostKind, setVideoPostKind] = useState<"reel" | "video">(
+    "reel"
+  );
+
+  // Scheduler modal state
+  const [pickerVisible, setPickerVisible] = useState(false);
+  const [pickerIndex, setPickerIndex] = useState<number | null>(null);
+  const [tempDate, setTempDate] = useState<Date>(new Date());
+  const [step, setStep] = useState<"date" | "time">("date"); // Android: two-step
+
+  // Draft loading state
+  const [loadingDraft, setLoadingDraft] = useState(false);
+  const [loadedDraftId, setLoadedDraftId] = useState<string | null>(null);
 
   // auto-sync calendar param into schedule ONLY when:
   // - there's a valid scheduled_at param
@@ -224,16 +304,7 @@ export default function CreateScreen() {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // Single-video mode toggle
-  const [videoPostKind, setVideoPostKind] = useState<"reel" | "video">("reel");
-
-  // Scheduler modal state
-  const [pickerVisible, setPickerVisible] = useState(false);
-  const [pickerIndex, setPickerIndex] = useState<number | null>(null);
-  const [tempDate, setTempDate] = useState<Date>(new Date());
-  const [step, setStep] = useState<"date" | "time">("date"); // Android: two-step
-
-  // Fetch user + connections
+  // Fetch user + connections + brand_profiles.industry
   useEffect(() => {
     (async () => {
       try {
@@ -245,16 +316,31 @@ export default function CreateScreen() {
           return;
         }
         setUid(user.id);
+
         setLoadingConn(true);
-        const { data: conn, error } = await supabase
+
+        // Connected accounts
+        const { data: conn, error: connErr } = await supabase
           .from("connected_meta_accounts")
           .select(
             "id,user_id,platform,page_id,page_name,ig_user_id,ig_username,access_token,token_expires_at"
           )
           .eq("user_id", user.id)
           .order("created_at", { ascending: false });
-        if (error) throw error;
+
+        if (connErr) throw connErr;
         setConnections((conn || []) as any);
+
+        // Brand profile industry from brand_profiles
+        const { data: bp, error: bpErr } = await supabase
+          .from("brand_profiles")
+          .select("industry")
+          .eq("user_id", user.id)
+          .maybeSingle();
+
+        if (!bpErr && bp) {
+          setIndustry(bp.industry ?? null);
+        }
       } catch (e) {
         console.error(e);
       } finally {
@@ -284,6 +370,144 @@ export default function CreateScreen() {
     () => mediaLocal.length === 1 && mediaLocal[0]?.type === "video",
     [mediaLocal]
   );
+
+  // Suggested angles for this industry
+  const suggestedAngles = useMemo(
+    () => getSuggestedAnglesForIndustry(industry),
+    [industry]
+  );
+
+  // Filtered categories based on search
+  const filteredAngleCategories = useMemo(() => {
+    const q = angleSearch.trim().toLowerCase();
+    if (!q) return ANGLE_CATEGORIES;
+
+    return ANGLE_CATEGORIES.map((cat) => ({
+      ...cat,
+      angles: cat.angles.filter(
+        (a) =>
+          a.label.toLowerCase().includes(q) ||
+          a.key.toLowerCase().includes(q)
+      ),
+    })).filter((cat) => cat.angles.length > 0);
+  }, [angleSearch]);
+
+  const selectedAngleDef = useMemo(
+    () => getAngleByKey(angle),
+    [angle]
+  );
+
+  /* -------------------------
+     Load draft when draft_id is present
+  --------------------------*/
+  useEffect(() => {
+    if (!uid) return;
+    if (!draftId) return;
+    if (loadedDraftId === draftId) return;
+
+    (async () => {
+      try {
+        setLoadingDraft(true);
+
+        const { data: draft, error } = await supabase
+          .from("v_scheduled_posts_with_media")
+          .select(
+            "id, user_id, caption, post_type, status, scheduled_at, media_ids, objective, angle"
+          )
+          .eq("id", draftId)
+          .single();
+
+        if (error) {
+          console.error("Error loading draft:", error);
+          Alert.alert("Error", "Failed to load draft.");
+          return;
+        }
+        if (!draft || draft.user_id !== uid) {
+          Alert.alert("Not found", "Draft not found.");
+          return;
+        }
+
+        // Clear current state
+        setCaption(draft.caption || "");
+        setObjective(
+          (draft.objective as ObjectiveEnum | null) || "awareness"
+        );
+        setAngle((draft.angle as AngleKey | null) || "how_to");
+
+        // Schedule
+        if (draft.scheduled_at) {
+          setDateTimes([new Date(draft.scheduled_at as string)]);
+        } else {
+          setDateTimes([]);
+        }
+        if (schedKey != null) setIgnoredParamKey(schedKey);
+
+        // If it's a single video-type draft, set videoPostKind based on post_type
+        if (
+          draft.post_type === "reel" ||
+          draft.post_type === "video"
+        ) {
+          setVideoPostKind(draft.post_type as "reel" | "video");
+        }
+
+        // Media
+        const mediaIds: string[] = (draft.media_ids as string[]) || [];
+        if (mediaIds.length) {
+          const { data: mediaRows, error: mediaErr } = await supabase
+            .from("media_assets")
+            .select(
+              "id, public_url, width, height, duration_ms, mime_type"
+            )
+            .in("id", mediaIds);
+
+          if (mediaErr) throw mediaErr;
+
+          const mediaMap = new Map(
+            (mediaRows || []).map((m: any) => [m.id, m])
+          );
+
+          const newMediaLocal = mediaIds
+            .map((mid) => {
+              const m = mediaMap.get(mid);
+              if (!m || !m.public_url) return null;
+              const mime = (m.mime_type || "").toLowerCase();
+              const isVideo =
+                mime.startsWith("video") ||
+                draft.post_type === "video" ||
+                draft.post_type === "reel";
+
+              return {
+                uri: m.public_url as string,
+                type: isVideo ? "video" : "image",
+                width: m.width ?? undefined,
+                height: m.height ?? undefined,
+                durationMs: m.duration_ms ?? undefined,
+                mimeType: m.mime_type ?? undefined,
+              } as {
+                uri: string;
+                type: "image" | "video";
+                width?: number;
+                height?: number;
+                durationMs?: number;
+                mimeType?: string;
+              };
+            })
+            .filter(Boolean) as typeof mediaLocal;
+
+          setMediaLocal(newMediaLocal);
+        } else {
+          setMediaLocal([]);
+        }
+
+        setLoadedDraftId(draftId);
+      } catch (e: any) {
+        console.error("Draft load error", e);
+        Alert.alert("Error", e?.message ?? "Failed to load draft.");
+      } finally {
+        setLoadingDraft(false);
+      }
+    })();
+  }, [uid, draftId, loadedDraftId, schedKey, mediaLocal.length]);
 
   /* -------------------------
      Media Picker
@@ -508,6 +732,9 @@ export default function CreateScreen() {
           p_target_ids: selectedTargets,
           p_status: status,
           p_scheduled_at: when,
+          // label objective + angle on write
+          p_objective: objective,
+          p_angle: angle,
         });
         if (error) throw error;
       }
@@ -607,9 +834,17 @@ export default function CreateScreen() {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
       <ScrollView contentContainerStyle={styles.content}>
-        {/* Top bar: title + connect warning */}
+        {/* Top bar: title + drafts + connect warning */}
         <View style={styles.topBar}>
           <Text style={styles.title}>Create</Text>
+          <TouchableOpacity
+            style={styles.draftsBtn}
+            onPress={() => router.push('/post/drafts')}
+            activeOpacity={0.9}
+          >
+            <FontAwesome name="file-text-o" size={12} color={TINT} />
+            <Text style={styles.draftsBtnText}>Drafts</Text>
+          </TouchableOpacity>
           {!canCreateAtAll && (
             <View style={styles.warnPill}>
               <FontAwesome name="plug" size={12} color="#991B1B" />
@@ -617,6 +852,13 @@ export default function CreateScreen() {
             </View>
           )}
         </View>
+
+        {loadingDraft && (
+          <View style={styles.draftLoadingRow}>
+            <ActivityIndicator size="small" color={MUTED} />
+            <Text style={styles.draftLoadingText}>Loading draft…</Text>
+          </View>
+        )}
 
         {/* Platform info (Facebook only, no toggle) */}
         <View style={styles.section}>
@@ -649,6 +891,18 @@ export default function CreateScreen() {
             </Text>
           )}
         </View>
+
+        {/* Industry hint */}
+        {industry && (
+          <View style={[styles.section, { marginTop: 6 }]}>
+            <Text style={{ fontSize: 11, color: MUTED }}>
+              Brand industry detected:{" "}
+              <Text style={{ fontWeight: "700", color: TEXT }}>
+                {prettyIndustryLabel(industry)}
+              </Text>
+            </Text>
+          </View>
+        )}
 
         {/* Media scroller */}
         <View style={styles.section}>
@@ -822,6 +1076,90 @@ export default function CreateScreen() {
             </Text>
           </View>
         )}
+
+        {/* Objective selector */}
+        <View style={styles.section}>
+          <Text style={styles.sectionLabel}>Objective</Text>
+          <View style={styles.objectiveRow}>
+            {OBJECTIVE_OPTIONS.map((opt) => {
+              const active = objective === opt.key;
+              return (
+                <TouchableOpacity
+                  key={opt.key}
+                  style={[
+                    styles.objectiveChip,
+                    active && styles.objectiveChipActive,
+                  ]}
+                  activeOpacity={0.9}
+                  onPress={() => setObjective(opt.key)}
+                >
+                  <Text
+                    style={[
+                      styles.objectiveLabel,
+                      active && styles.objectiveLabelActive,
+                    ]}
+                  >
+                    {opt.label}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.objectiveSubtitle,
+                      active && styles.objectiveSubtitleActive,
+                    ]}
+                    numberOfLines={2}
+                  >
+                    {opt.subtitle}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* Angle selector – collapsed, opens modal */}
+        <View style={styles.section}>
+          <Text style={styles.sectionLabel}>Angle</Text>
+          <TouchableOpacity
+            style={styles.angleSelector}
+            onPress={() => {
+              setAngleSearch("");
+              setAngleModalVisible(true);
+            }}
+            activeOpacity={0.9}
+          >
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <FontAwesome
+                name="tag"
+                size={14}
+                color={selectedAngleDef ? TINT : MUTED}
+                style={{ marginRight: 8 }}
+              />
+              {selectedAngleDef ? (
+                <Text style={styles.angleSelectorLabel}>
+                  {selectedAngleDef.label}
+                </Text>
+              ) : (
+                <Text style={styles.angleSelectorPlaceholder}>
+                  Select angle
+                </Text>
+              )}
+            </View>
+            <FontAwesome
+              name="chevron-right"
+              size={12}
+              color={MUTED}
+            />
+          </TouchableOpacity>
+          {industry && selectedAngleDef && (
+            <Text style={styles.angleSelectorHint}>
+              Personalized for{" "}
+              <Text style={{ fontWeight: "700" }}>
+                {prettyIndustryLabel(industry)}
+              </Text>
+              .
+            </Text>
+          )}
+        </View>
 
         {/* Caption */}
         <View style={styles.section}>
@@ -1030,6 +1368,148 @@ export default function CreateScreen() {
           )}
         </View>
       </Modal>
+
+      {/* Angle Selector Modal */}
+      <Modal
+        visible={angleModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAngleModalVisible(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => setAngleModalVisible(false)}
+        />
+        <View style={[styles.modalCard, styles.angleModalCard]}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Select angle</Text>
+            <TouchableOpacity
+              onPress={() => setAngleModalVisible(false)}
+            >
+              <FontAwesome name="times" size={16} color={MUTED} />
+            </TouchableOpacity>
+          </View>
+
+          {/* Search bar */}
+          <View style={[styles.angleSearchRow, { marginTop: 10 }]}>
+            <FontAwesome
+              name="search"
+              size={14}
+              color={MUTED}
+              style={{ marginRight: 6 }}
+            />
+            <TextInput
+              style={styles.angleSearchInput}
+              placeholder="Search angles (e.g. 'testimonial', 'promo')"
+              placeholderTextColor="#9CA3AF"
+              value={angleSearch}
+              onChangeText={setAngleSearch}
+              autoCorrect={false}
+            />
+          </View>
+
+          {/* Suggested angles for this industry (only when no search) */}
+          {suggestedAngles.length > 0 && !angleSearch.trim() && (
+            <View style={{ marginTop: 12 }}>
+              <Text style={styles.angleCategoryLabel}>
+                Suggested for{" "}
+                {prettyIndustryLabel(industry) || "your brand"}
+              </Text>
+              <Text style={styles.angleCategoryDesc}>
+                Based on your brand industry, here are good starting
+                angles.
+              </Text>
+              <View style={styles.angleRow}>
+                {suggestedAngles.map((opt) => {
+                  const active = angle === opt.key;
+                  return (
+                    <TouchableOpacity
+                      key={opt.key}
+                      style={[
+                        styles.angleChip,
+                        active && styles.angleChipActive,
+                      ]}
+                      onPress={() => setAngle(opt.key)}
+                      activeOpacity={0.9}
+                    >
+                      <Text
+                        style={[
+                          styles.angleText,
+                          active && styles.angleTextActive,
+                        ]}
+                      >
+                        {opt.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          )}
+
+          {/* Categories list */}
+          <ScrollView
+            style={{ marginTop: 12, maxHeight: 280 }}
+            nestedScrollEnabled
+          >
+            {filteredAngleCategories.map((cat) => (
+              <View key={cat.id} style={{ marginBottom: 10 }}>
+                <Text style={styles.angleCategoryLabel}>{cat.label}</Text>
+                {cat.description ? (
+                  <Text style={styles.angleCategoryDesc}>
+                    {cat.description}
+                  </Text>
+                ) : null}
+                <View style={styles.angleRow}>
+                  {cat.angles.map((opt) => {
+                    const active = angle === opt.key;
+                    return (
+                      <TouchableOpacity
+                        key={opt.key}
+                        style={[
+                          styles.angleChip,
+                          active && styles.angleChipActive,
+                        ]}
+                        onPress={() => setAngle(opt.key)}
+                        activeOpacity={0.9}
+                      >
+                        <Text
+                          style={[
+                            styles.angleText,
+                            active && styles.angleTextActive,
+                          ]}
+                        >
+                          {opt.label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </View>
+            ))}
+
+            {filteredAngleCategories.length === 0 && (
+              <Text
+                style={{ color: MUTED, fontSize: 12, marginTop: 6 }}
+              >
+                No angles found. Try another keyword.
+              </Text>
+            )}
+          </ScrollView>
+
+          <TouchableOpacity
+            style={[
+              styles.actionBtn,
+              styles.btnPrimary,
+              { marginTop: 10 },
+            ]}
+            onPress={() => setAngleModalVisible(false)}
+            activeOpacity={0.9}
+          >
+            <Text style={styles.actionPrimaryText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -1046,9 +1526,25 @@ const styles = StyleSheet.create({
   },
 
   topBar: { flexDirection: "row", alignItems: "center", marginBottom: 6 },
-  title: { fontSize: 22, fontWeight: "800", color: TEXT },
+  title: { flex: 1, fontSize: 22, fontWeight: "800", color: TEXT },
+  draftsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#EEF2FF",
+    marginRight: 8,
+  },
+  draftsBtnText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: TINT,
+  },
   warnPill: {
-    marginLeft: "auto",
     backgroundColor: "#FEF2F2",
     borderColor: "#FECACA",
     borderWidth: 1,
@@ -1060,6 +1556,17 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   warnText: { color: "#991B1B", fontSize: 12, fontWeight: "700" },
+
+  draftLoadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 4,
+  },
+  draftLoadingText: {
+    fontSize: 12,
+    color: MUTED,
+  },
 
   section: { marginTop: 12 },
   sectionLabel: {
@@ -1174,6 +1681,125 @@ const styles = StyleSheet.create({
     color: TEXT,
   },
   videoToggleTextActive: {
+    color: "#F9FAFB",
+  },
+
+  // objective chips
+  objectiveRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  objectiveChip: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F9FAFB",
+  },
+  objectiveChipActive: {
+    backgroundColor: "#111827",
+    borderColor: "#111827",
+  },
+  objectiveLabel: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: TEXT,
+    marginBottom: 2,
+  },
+  objectiveLabelActive: {
+    color: "#F9FAFB",
+  },
+  objectiveSubtitle: {
+    fontSize: 11,
+    color: MUTED,
+  },
+  objectiveSubtitleActive: {
+    color: "#E5E7EB",
+  },
+
+  // angle selector (collapsed)
+  angleSelector: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#F9FAFB",
+  },
+  angleSelectorLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: TEXT,
+  },
+  angleSelectorPlaceholder: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: MUTED,
+  },
+  angleSelectorHint: {
+    marginTop: 4,
+    fontSize: 11,
+    color: MUTED,
+  },
+
+  // angle search + categories
+  angleSearchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#F9FAFB",
+  },
+  angleSearchInput: {
+    flex: 1,
+    fontSize: 13,
+    color: TEXT,
+    paddingVertical: 2,
+  },
+  angleCategoryLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: TEXT,
+    marginBottom: 2,
+  },
+  angleCategoryDesc: {
+    fontSize: 11,
+    color: MUTED,
+    marginBottom: 4,
+  },
+
+  // angle chips
+  angleRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  angleChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F3F4F6",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  angleChipActive: {
+    backgroundColor: "#111827",
+    borderColor: "#111827",
+  },
+  angleText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: TEXT,
+  },
+  angleTextActive: {
     color: "#F9FAFB",
   },
 
@@ -1298,6 +1924,10 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 6 },
     shadowRadius: 12,
     elevation: 3,
+  },
+  angleModalCard: {
+    // slightly taller for angle picker
+    maxHeight: "80%",
   },
   modalHeader: { flexDirection: "row", alignItems: "center" },
   modalTitle: {

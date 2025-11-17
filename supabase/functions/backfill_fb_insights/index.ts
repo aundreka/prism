@@ -32,10 +32,19 @@ type ConnectedMetaRow = {
   access_token: string | null;
 };
 
+type FbAttachment = {
+  media_type?: string; // "photo", "video", "share", "link", etc.
+  type?: string;       // sometimes present (e.g. "photo", "video_inline")
+};
+
 type FbPost = {
   id: string;
   created_time: string;
   message?: string;
+  status_type?: string | null;
+  attachments?: {
+    data?: FbAttachment[];
+  };
 };
 
 type FbPostsResponse = {
@@ -71,7 +80,7 @@ type ExternalPostInsert = {
   object_id: string; // FB post ID
   page_id: string;
   caption: string | null;
-  content_type: string | null;
+  content_type: string | null; // raw FB-ish type → normalized in DB by trigger
   created_at: string;
 };
 
@@ -99,6 +108,47 @@ function daysAgoToUnix(days: number): number {
   return Math.floor(ms / 1000);
 }
 
+// Infer a usable content_type string from FB post fields
+function inferContentTypeFromPost(post: FbPost): string | null {
+  const firstAttachment = post.attachments?.data?.[0];
+
+  const mediaType = firstAttachment?.media_type?.toLowerCase();
+  const type = firstAttachment?.type?.toLowerCase();
+  const statusType = post.status_type?.toLowerCase();
+
+  // Prefer explicit media_type
+  if (mediaType) {
+    if (mediaType.includes("photo") || mediaType === "image") return "photo";
+    if (mediaType.includes("video")) return "video";
+    if (mediaType.includes("share") || mediaType.includes("link")) return "link";
+    if (mediaType.includes("album") || mediaType.includes("carousel")) {
+      return "carousel";
+    }
+  }
+
+  // Fallback to attachment.type
+  if (type) {
+    if (type.includes("photo") || type === "image") return "photo";
+    if (type.includes("video")) return "video";
+    if (type.includes("share") || type.includes("link")) return "link";
+    if (type.includes("album") || type.includes("carousel")) return "carousel";
+  }
+
+  // Fallback to status_type
+  if (statusType) {
+    if (statusType.includes("shared_story")) return "share";
+    if (statusType.includes("added_photos")) return "photo";
+    if (statusType.includes("added_video")) return "video";
+  }
+
+  // Last resort: if there's a message only, treat as "status"
+  if (post.message && !firstAttachment) {
+    return "status";
+  }
+
+  return null;
+}
+
 // Fetch connected FB accounts (optionally for one user)
 async function fetchConnectedFacebookAccounts(
   supabase: ReturnType<typeof createClient>,
@@ -119,7 +169,7 @@ async function fetchConnectedFacebookAccounts(
   return (data || []) as ConnectedMetaRow[];
 }
 
-// Fetch posts for a Page with caption
+// Fetch posts for a Page with caption + basic attachment metadata
 async function fetchPagePosts(
   pageId: string,
   accessToken: string,
@@ -127,11 +177,18 @@ async function fetchPagePosts(
 ): Promise<FbPost[]> {
   const allPosts: FbPost[] = [];
 
-  const fields = ["id", "created_time", "message"].join(",");
+  // We include attachments + status_type so we can infer content_type
+  const fields = [
+    "id",
+    "created_time",
+    "message",
+    "status_type",
+    "attachments{media_type,type}",
+  ].join(",");
 
   let url =
     `${GRAPH_BASE}/${pageId}/posts` +
-    `?fields=${fields}` +
+    `?fields=${encodeURIComponent(fields)}` +
     `&limit=50&since=${sinceUnix}` +
     `&access_token=${accessToken}`;
 
@@ -367,13 +424,15 @@ serve(async (req) => {
 
       // 1) Upsert external_posts for all posts
       const externalRows: ExternalPostInsert[] = posts.map((p) => {
+        const contentType = inferContentTypeFromPost(p);
+
         return {
           user_id: account.user_id,
           platform: "facebook",
           object_id: p.id,
           page_id: account.page_id!,
           caption: p.message ?? null,
-          content_type: null, // could be inferred later from other fields if needed
+          content_type: contentType, // DB trigger will map this → post_type_enum
           created_at: p.created_time,
         };
       });
