@@ -1,5 +1,10 @@
 // app/(tabs)/calendar.tsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -17,6 +22,10 @@ import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useHeaderHeight } from "@react-navigation/elements";
 import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
+import {
+  getTimeSegmentRecommendations,
+  TimeSegmentRecommendation,
+} from "@/lib/timeRecommendations";
 
 type PlatformEnum = "facebook" | "instagram";
 type PostStatusEnum =
@@ -36,21 +45,16 @@ type ScheduledRow = {
   caption: string | null;
   post_type: string;
   status: PostStatusEnum;
-  scheduled_at: string | null; // ISO
+  scheduled_at: string | null;
   posted_at: string | null;
   permalink: string | null;
   error_message: string | null;
 };
 
-type TimeRecommendation = {
+type PageOption = {
+  id: string;
+  label: string;
   platform: PlatformEnum;
-  timeslot: string; // timestamptz ISO
-  dow: number; // 0–6 (Sunday=0 in Postgres)
-  hour: number;
-  predicted_avg: number | null; // final_score
-  segment_id: number | null;
-  segment_name: string | null;
-  sample_count?: number | null; // optional per-hour sample count
 };
 
 const BG = "#F8FAFC";
@@ -104,7 +108,7 @@ function formatTimeWithDate(iso: string) {
 function scoreToGradientColor(score: number, maxScore: number) {
   if (!maxScore || score <= 0) return "#FFFFFF";
 
-  const t = Math.max(0, Math.min(1, score / maxScore)); // 0..1
+  const t = Math.max(0, Math.min(1, score / maxScore));
 
   const hsl = (
     h1: number,
@@ -123,30 +127,19 @@ function scoreToGradientColor(score: number, maxScore: number) {
 
   if (t < 0.5) {
     const tt = t / 0.5;
-    return hsl(
-      55,
-      15,
-      98, // warm white
-      52,
-      85,
-      85, // soft yellow
-      tt
-    );
+    return hsl(55, 15, 98, 52, 85, 85, tt);
   } else {
     const tt = (t - 0.5) / 0.5;
-    return hsl(
-      52,
-      85,
-      85, // yellow
-      125,
-      65,
-      78, // pastel green
-      tt
-    );
+    return hsl(52, 85, 85, 125, 65, 78, tt);
   }
 }
 
-type HourSlot = { hour: number; rec?: TimeRecommendation };
+type HourSlot = { hour: number; rec?: TimeSegmentRecommendation };
+
+function getRecScore(rec?: TimeSegmentRecommendation | undefined): number {
+  if (!rec) return 0;
+  return rec.hybridSample ?? 0;
+}
 
 export default function CalendarScreen() {
   const insets = useSafeAreaInsets();
@@ -156,34 +149,43 @@ export default function CalendarScreen() {
   const [cursor, setCursor] = useState<Date>(startOfMonth(new Date()));
   const [selected, setSelected] = useState<string>(ymd(new Date()));
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [rows, setRows] = useState<ScheduledRow[]>([]);
 
   const [viewMode, setViewMode] = useState<"month" | "day">("month");
-  const [recs, setRecs] = useState<TimeRecommendation[]>([]);
+  const [recs, setRecs] = useState<TimeSegmentRecommendation[]>([]);
   const [recError, setRecError] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
   const [sortMode, setSortMode] = useState<"time" | "score">("time");
 
-  // swipe
+  const [pages, setPages] = useState<PageOption[]>([]);
+  const [selectedPageId, setSelectedPageId] = useState<string | "all">("all");
+
   const [touchStartX, setTouchStartX] = useState<number | null>(null);
-  const SWIPE_THRESHOLD = 40; // px
+  const SWIPE_THRESHOLD = 40;
 
   const selectedDate = useMemo(() => {
     const [y, m, d] = selected.split("-").map(Number);
     return new Date(y, (m || 1) - 1, d || 1);
   }, [selected]);
 
-  useEffect(() => {
-    (async () => {
-      const { data } = await supabase.auth.getUser();
-      const user = data?.user;
-      if (!user) {
-        Alert.alert("Sign in required", "Please sign in.");
-        return;
+  const fetchAll = useCallback(
+    async (opts?: { isRefresh?: boolean }) => {
+      const isRefresh = opts?.isRefresh ?? false;
+      if (isRefresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
       }
 
-      setLoading(true);
       try {
+        const { data } = await supabase.auth.getUser();
+        const user = data?.user;
+        if (!user) {
+          Alert.alert("Sign in required", "Please sign in.");
+          return;
+        }
+
         const min = addMonths(startOfMonth(new Date()), -6);
         const max = addMonths(startOfMonth(new Date()), +7);
         const { data: sched, error } = await supabase
@@ -209,31 +211,97 @@ export default function CalendarScreen() {
         if (error) throw error;
         setRows((sched || []) as any);
 
-        setRecError(null);
-        const { data: recData, error: recErr } = await supabase.rpc(
-          "get_time_segment_recommendations",
-          { p_platform: "facebook" }
-        );
+        const { data: conns, error: connsErr } = await supabase
+          .from("connected_meta_accounts")
+          .select("page_id,page_name,ig_user_id,ig_username,is_active")
+          .eq("user_id", user.id)
+          .eq("is_active", true);
 
-        if (recErr) {
-          console.log("get_time_segment_recommendations error:", recErr);
-          setRecError(recErr.message ?? "Could not load recommendations.");
-          setRecs([]);
+        if (connsErr) {
+          console.log("connected_meta_accounts error:", connsErr);
         } else {
-          setRecs((recData || []) as TimeRecommendation[]);
+          const opts: PageOption[] = [];
+          (conns || []).forEach((c: any) => {
+            if (c.page_id) {
+              opts.push({
+                id: c.page_id,
+                label: c.page_name || c.page_id,
+                platform: "facebook",
+              });
+            }
+            if (c.ig_user_id) {
+              opts.push({
+                id: c.ig_user_id,
+                label: c.ig_username || c.ig_user_id,
+                platform: "instagram",
+              });
+            }
+          });
+          setPages(opts);
+          if (opts.length === 1) {
+            setSelectedPageId(opts[0].id);
+          } else {
+            setSelectedPageId("all");
+          }
+        }
+
+        setRecError(null);
+        try {
+          const recsData = await getTimeSegmentRecommendations("facebook", {
+            horizonDays: 7,
+            weightModel: 0.7,
+            weightBandit: 0.3,
+          });
+          setRecs(recsData);
+        } catch (err: any) {
+          console.log("getTimeSegmentRecommendations error:", err);
+          setRecError(err?.message ?? "Could not load recommendations.");
+          setRecs([]);
         }
       } catch (e: any) {
         console.error(e);
         Alert.alert("Error", e?.message ?? "Failed to load calendar.");
       } finally {
-        setLoading(false);
+        if (isRefresh) {
+          setRefreshing(false);
+        } else {
+          setLoading(false);
+        }
       }
-    })();
-  }, []);
+    },
+    []
+  );
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  const handleRefresh = useCallback(() => {
+    fetchAll({ isRefresh: true });
+  }, [fetchAll]);
+
+  const pageMetaByTargetId = useMemo(() => {
+    const m = new Map<
+      string,
+      {
+        label: string;
+        platform: PlatformEnum;
+      }
+    >();
+    for (const p of pages) {
+      m.set(p.id, { label: p.label, platform: p.platform });
+    }
+    return m;
+  }, [pages]);
+
+  const filteredRows = useMemo(() => {
+    if (selectedPageId === "all") return rows;
+    return rows.filter((r) => r.target_id === selectedPageId);
+  }, [rows, selectedPageId]);
 
   const byDate = useMemo(() => {
     const m = new Map<string, ScheduledRow[]>();
-    for (const r of rows) {
+    for (const r of filteredRows) {
       const dt = r.scheduled_at ? new Date(r.scheduled_at) : null;
       if (!dt) continue;
       const key = ymd(dt);
@@ -241,13 +309,12 @@ export default function CalendarScreen() {
       m.get(key)!.push(r);
     }
     return m;
-  }, [rows]);
+  }, [filteredRows]);
 
   const selectedList = byDate.get(selected) || [];
 
-  // group recommendations by day-of-week
   const recsByDow = useMemo(() => {
-    const m = new Map<number, TimeRecommendation[]>();
+    const m = new Map<number, TimeSegmentRecommendation[]>();
     for (const r of recs) {
       if (!m.has(r.dow)) m.set(r.dow, []);
       m.get(r.dow)!.push(r);
@@ -256,14 +323,14 @@ export default function CalendarScreen() {
   }, [recs]);
 
   const hourlySlots: HourSlot[] = useMemo(() => {
-    const jsDow = selectedDate.getDay(); // 0=Sun..6=Sat
+    const jsDow = selectedDate.getDay();
     const list = recsByDow.get(jsDow) || [];
-    const bestByHour = new Map<number, TimeRecommendation>();
+    const bestByHour = new Map<number, TimeSegmentRecommendation>();
 
     for (const r of list) {
       const existing = bestByHour.get(r.hour);
-      const s = r.predicted_avg ?? 0;
-      const sExisting = existing?.predicted_avg ?? 0;
+      const s = getRecScore(r);
+      const sExisting = existing ? getRecScore(existing) : 0;
       if (!existing || s > sExisting) {
         bestByHour.set(r.hour, r);
       }
@@ -279,7 +346,7 @@ export default function CalendarScreen() {
   const maxScore = useMemo(() => {
     let max = 0;
     for (const slot of hourlySlots) {
-      const s = slot.rec?.predicted_avg ?? 0;
+      const s = getRecScore(slot.rec);
       if (s > max) max = s;
     }
     return max;
@@ -291,16 +358,15 @@ export default function CalendarScreen() {
       return base.sort((a, b) => a.hour - b.hour);
     }
     return base.sort((a, b) => {
-      const sa = a.rec?.predicted_avg ?? 0;
-      const sb = b.rec?.predicted_avg ?? 0;
+      const sa = getRecScore(a.rec);
+      const sb = getRecScore(b.rec);
       if (sb !== sa) return sb - sa;
       return a.hour - b.hour;
     });
   }, [hourlySlots, sortMode]);
 
-  // Build grid for current month
   const monthStart = startOfMonth(cursor);
-  const firstWeekday = (monthStart.getDay() + 6) % 7; // Mon start
+  const firstWeekday = (monthStart.getDay() + 6) % 7;
   const totalDays = daysInMonth(cursor);
   const cells: Array<{ date: Date | null; key: string }> = [];
 
@@ -318,7 +384,6 @@ export default function CalendarScreen() {
 
   const todayKey = ymd(new Date());
 
-  // swipe helpers
   const handleTouchStart = (e: GestureResponderEvent) => {
     const evt = e.nativeEvent as NativeTouchEvent;
     setTouchStartX(evt.pageX);
@@ -377,6 +442,11 @@ export default function CalendarScreen() {
     );
   }
 
+  const activePageFilterLabel =
+    selectedPageId === "all"
+      ? "All pages"
+      : pageMetaByTargetId.get(selectedPageId)?.label ?? "This page";
+
   return (
     <View
       style={[
@@ -387,7 +457,6 @@ export default function CalendarScreen() {
         },
       ]}
     >
-      {/* Top header */}
       <View style={styles.header}>
         <Text style={styles.title}>
           {cursor.toLocaleString(undefined, { month: "long" })}{" "}
@@ -402,9 +471,10 @@ export default function CalendarScreen() {
           contentContainerStyle={{ paddingBottom: 16 }}
           onTouchStart={handleTouchStart}
           onTouchEnd={handleMonthTouchEnd}
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
           ListHeaderComponent={
             <View style={styles.card}>
-              {/* Mode toggle */}
               <View style={styles.modeToggleRow}>
                 <TouchableOpacity
                   onPress={() => setViewMode("month")}
@@ -442,8 +512,57 @@ export default function CalendarScreen() {
                 </TouchableOpacity>
               </View>
 
+              {pages.length > 0 && (
+                <View style={styles.pageFilterRow}>
+                  <Text style={styles.pageFilterLabel}>Page</Text>
+                  <View style={styles.pageFilterChips}>
+                    {pages.length > 1 && (
+                      <TouchableOpacity
+                        style={[
+                          styles.pageChip,
+                          selectedPageId === "all" && styles.pageChipActive,
+                        ]}
+                        onPress={() => setSelectedPageId("all")}
+                        activeOpacity={0.8}
+                      >
+                        <Text
+                          style={[
+                            styles.pageChipText,
+                            selectedPageId === "all" &&
+                              styles.pageChipTextActive,
+                          ]}
+                        >
+                          All
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                    {pages.map((p) => (
+                      <TouchableOpacity
+                        key={`${p.platform}-${p.id}`}
+                        style={[
+                          styles.pageChip,
+                          selectedPageId === p.id && styles.pageChipActive,
+                        ]}
+                        onPress={() => setSelectedPageId(p.id)}
+                        activeOpacity={0.8}
+                      >
+                        <Text
+                          style={[
+                            styles.pageChipText,
+                            selectedPageId === p.id &&
+                              styles.pageChipTextActive,
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {p.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              )}
+
               <View style={styles.monthContainer}>
-                {/* Week headings */}
                 <View style={styles.weekRow}>
                   {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(
                     (w) => (
@@ -454,7 +573,6 @@ export default function CalendarScreen() {
                   )}
                 </View>
 
-                {/* Grid */}
                 <View style={styles.grid}>
                   {cells.map((c) => {
                     if (!c.date) {
@@ -522,7 +640,6 @@ export default function CalendarScreen() {
                   })}
                 </View>
 
-                {/* Day details */}
                 <View style={styles.bottomSheet}>
                   <View style={styles.bottomHeader}>
                     <Text style={styles.bottomTitle}>
@@ -536,6 +653,11 @@ export default function CalendarScreen() {
                       {selectedList.length} items
                     </Text>
                   </View>
+                  {pages.length > 0 && (
+                    <Text style={styles.bottomSubLabel}>
+                      Showing: {activePageFilterLabel}
+                    </Text>
+                  )}
 
                   {selectedList.length === 0 ? (
                     <Text style={{ color: MUTED, marginTop: 6 }}>
@@ -576,6 +698,10 @@ export default function CalendarScreen() {
                             />
                           );
 
+                        const pageMeta = pageMetaByTargetId.get(
+                          item.target_id
+                        );
+
                         return (
                           <View
                             key={item.id}
@@ -609,6 +735,7 @@ export default function CalendarScreen() {
                                 </Text>
                                 <Text style={styles.itemMeta}>
                                   {time} • {item.status.toUpperCase()}
+                                  {pageMeta ? ` • ${pageMeta.label}` : ""}
                                 </Text>
                               </View>
                               {item.permalink ? (
@@ -636,9 +763,10 @@ export default function CalendarScreen() {
           contentContainerStyle={{ paddingBottom: 16 }}
           onTouchStart={handleTouchStart}
           onTouchEnd={handleDayTouchEnd}
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
           ListHeaderComponent={
             <View style={styles.card}>
-              {/* Mode toggle */}
               <View style={styles.modeToggleRow}>
                 <TouchableOpacity
                   onPress={() => setViewMode("month")}
@@ -676,6 +804,56 @@ export default function CalendarScreen() {
                 </TouchableOpacity>
               </View>
 
+              {pages.length > 0 && (
+                <View style={styles.pageFilterRow}>
+                  <Text style={styles.pageFilterLabel}>Page</Text>
+                  <View style={styles.pageFilterChips}>
+                    {pages.length > 1 && (
+                      <TouchableOpacity
+                        style={[
+                          styles.pageChip,
+                          selectedPageId === "all" && styles.pageChipActive,
+                        ]}
+                        onPress={() => setSelectedPageId("all")}
+                        activeOpacity={0.8}
+                      >
+                        <Text
+                          style={[
+                            styles.pageChipText,
+                            selectedPageId === "all" &&
+                              styles.pageChipTextActive,
+                          ]}
+                        >
+                          All
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                    {pages.map((p) => (
+                      <TouchableOpacity
+                        key={`${p.platform}-${p.id}`}
+                        style={[
+                          styles.pageChip,
+                          selectedPageId === p.id && styles.pageChipActive,
+                        ]}
+                        onPress={() => setSelectedPageId(p.id)}
+                        activeOpacity={0.8}
+                      >
+                        <Text
+                          style={[
+                            styles.pageChipText,
+                            selectedPageId === p.id &&
+                              styles.pageChipTextActive,
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {p.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              )}
+
               <View style={styles.dailyContainer}>
                 <View style={styles.dailyHeaderRow}>
                   <Text style={styles.dailyTitle}>
@@ -687,6 +865,13 @@ export default function CalendarScreen() {
                     })}
                   </Text>
                 </View>
+
+                {pages.length > 0 && (
+                  <Text style={styles.bottomSubLabel}>
+                    Recommendations use your data across{" "}
+                    {activePageFilterLabel.toLowerCase()}.
+                  </Text>
+                )}
 
                 {recError ? (
                   <Text
@@ -839,9 +1024,8 @@ export default function CalendarScreen() {
                         <Text style={styles.dailyMathText}>
                           The color of each slot reflects{" "}
                           <Text style={styles.codeText}>final_score</Text>{" "}
-                          (scaled 0–100%): softer blues & greens indicate
-                          stronger expected performance, while pure white means
-                          no uplift yet based on current data.
+                          (scaled relative to today’s max): stronger colors =
+                          stronger expected performance, white = no uplift yet.
                         </Text>
                       </View>
                     )}
@@ -850,13 +1034,14 @@ export default function CalendarScreen() {
               </View>
             </View>
           }
-          renderItem={({ item, index }) => {
+          renderItem={({ item }) => {
             const { hour, rec } = item;
-            const score = rec?.predicted_avg ?? 0;
+            const rawScore = getRecScore(rec);
             const scorePct =
-              score > 0 ? `${Math.round(score * 100)}%` : "0%";
-            const bgColor = scoreToGradientColor(score, maxScore);
-            const sampleCount = rec?.sample_count ?? 0;
+              rawScore > 0 ? `${Math.round(rawScore * 100)}%` : "0%";
+
+            const bgColor = scoreToGradientColor(rawScore, maxScore);
+            const sampleCount = (rec as any)?.sample_count ?? 0;
 
             const postsForHour = selectedList.filter((row) => {
               const tsStr = row.scheduled_at || row.posted_at;
@@ -870,13 +1055,12 @@ export default function CalendarScreen() {
               );
             });
             const postsCount = postsForHour.length;
-            const postsLabel =
-              postsCount > 0
-                ? `${postsCount} post${
-                    postsCount > 1 ? "s" : ""
-                  } on this day at this hour`
-                : "No posts at this hour on this day";
-
+           const postsLabel =
+  postsCount > 0
+    ? `${postsCount} post${
+        postsCount > 1 ? "s" : ""
+      } on this day at this hour`
+    : "No posts at this hour on this day";
             const slotDate = new Date(
               selectedDate.getFullYear(),
               selectedDate.getMonth(),
@@ -889,16 +1073,9 @@ export default function CalendarScreen() {
             const slotIso = slotDate.toISOString();
 
             return (
-              <View
-                style={[
-                  styles.slotCard,
-                  { backgroundColor: bgColor },
-                ]}
-              >
+              <View style={[styles.slotCard, { backgroundColor: bgColor }]}>
                 <View style={styles.slotTextCol}>
-                  <Text style={styles.slotHour}>
-                    {formatHourLabel(hour)}
-                  </Text>
+                  <Text style={styles.slotHour}>{formatHourLabel(hour)}</Text>
                   <Text style={styles.slotMeta}>
                     Score: {scorePct} • {postsLabel}
                   </Text>
@@ -965,7 +1142,6 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
 
-  // Mode toggle
   modeToggleRow: {
     flexDirection: "row",
     paddingTop: 10,
@@ -991,6 +1167,44 @@ const styles = StyleSheet.create({
   },
   modeTabText: { fontSize: 12, fontWeight: "600", color: MUTED },
   modeTabTextActive: { color: "#FFFFFF" },
+
+  pageFilterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 10,
+    gap: 8,
+  },
+  pageFilterLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  pageFilterChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    flex: 1,
+  },
+  pageChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: SOFT,
+    backgroundColor: "#F9FAFB",
+  },
+  pageChipActive: {
+    backgroundColor: "#111827",
+    borderColor: "#111827",
+  },
+  pageChipText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  pageChipTextActive: {
+    color: "#FFFFFF",
+  },
 
   monthContainer: {
     flex: 1,
@@ -1078,6 +1292,11 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     fontSize: 12,
   },
+  bottomSubLabel: {
+    marginTop: 4,
+    fontSize: 11,
+    color: MUTED,
+  },
 
   itemRow: {
     flexDirection: "row",
@@ -1090,7 +1309,6 @@ const styles = StyleSheet.create({
   itemCaption: { color: TEXT, fontWeight: "700", fontSize: 13 },
   itemMeta: { color: MUTED, fontSize: 12, marginTop: 2 },
 
-  // DAILY VIEW
   dailyContainer: {
     paddingTop: 10,
     backgroundColor: "#fff",
@@ -1121,7 +1339,6 @@ const styles = StyleSheet.create({
     marginLeft: 6,
   },
 
-  // Sort toggle
   sortToggleRow: {
     flexDirection: "row",
     alignSelf: "flex-start",
@@ -1155,7 +1372,6 @@ const styles = StyleSheet.create({
     color: TINT,
   },
 
-  // Slot cards
   slotCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -1164,7 +1380,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     marginBottom: 10,
     minHeight: 52,
-    marginHorizontal: 16, // align with card padding
+    marginHorizontal: 16,
   },
   slotTextCol: {
     flex: 1,

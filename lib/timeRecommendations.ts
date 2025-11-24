@@ -1,96 +1,98 @@
 // lib/timeRecommendations.ts
 import { supabase } from "@/lib/supabase";
-import { sampleBeta } from "./bandit";
 
-export type PlatformEnum = "facebook" | "instagram";
+export type TimeSegmentRecommendation = {
+  platform: "facebook";
+  timeslot: string;          // timestamptz ISO
+  dow: number;               // 0–6 (Sunday=0 in Postgres)
+  hour: number;              // 0–23
+  segment_id: number | null;
+  predicted_avg: number | null;
+  bandit_alpha: number | null;
+  bandit_beta: number | null;
+  hybridSample: number;      // final mixed (model + bandit) score, 0–1
+  sample_count?: number | null; // optional, if your RPC returns it
+};
 
-export type TimeSegmentBanditRow = {
-  platform: PlatformEnum;
-  timeslot: string;      // timestamptz → ISO string
+type BanditInputRow = {
+  platform: string;
+  timeslot: string;
   dow: number;
   hour: number;
   segment_id: number | null;
   predicted_avg: number | null;
   bandit_alpha: number | null;
   bandit_beta: number | null;
+  sample_count?: number | null;
 };
-
-export type TimeSegmentRecommendation = TimeSegmentBanditRow & {
-  theta: number;         // sampled bandit value
-  hybridSample: number;  // blended score used for ranking
-};
-
-type GetRecommendationsOptions = {
-  horizonDays?: number;  // default 7
-  weightModel?: number;  // default 0.7
-  weightBandit?: number; // default 0.3
-};
-
-// If you want, you can mirror the generated error shape:
-type RpcShape =
-  | TimeSegmentBanditRow[]
-  | { Error: "Type mismatch: Cannot cast single object to array type. Remove Array wrapper from return type or make sure you are not using .single() up in the calling chain"; };
-
-function isRowArray(data: RpcShape | null): data is TimeSegmentBanditRow[] {
-  return Array.isArray(data);
-}
 
 export async function getTimeSegmentRecommendations(
-  platform: PlatformEnum,
-  options: GetRecommendationsOptions = {}
+  platform: "facebook",
+  opts: { horizonDays: number; weightModel: number; weightBandit: number }
 ): Promise<TimeSegmentRecommendation[]> {
-  const {
-    horizonDays = 7,
-    weightModel = 0.7,
-    weightBandit = 0.3,
-  } = options;
+  const { horizonDays, weightModel, weightBandit } = opts;
 
-  const { data, error } = await supabase.rpc("get_time_segment_bandit_inputs", {
-    p_platform: platform,
-    p_horizon_days: horizonDays,
-  });
+  const { data, error } = await supabase.rpc(
+    "get_time_segment_bandit_inputs",
+    {
+      p_platform: platform,
+      p_horizon_days: horizonDays,
+    }
+  );
+
+  console.log("[timeRecs] RPC error:", error);
+  console.log(
+    "[timeRecs] RPC raw data length:",
+    data ? (data as any[]).length : 0
+  );
+  console.log(
+    "[timeRecs] First few rows:",
+    ((data as any[]) || []).slice(0, 3)
+  );
 
   if (error) {
-    console.error("get_time_segment_bandit_inputs error:", error);
     throw error;
   }
 
-  if (!data) return [];
+  const rows: BanditInputRow[] = (data || []) as any[];
 
-  // Runtime safety + TS narrowing for the weird union type
-  if (!isRowArray(data)) {
-    console.warn("Unexpected RPC shape for get_time_segment_bandit_inputs:", data);
+  if (!rows.length) {
+    console.log("[timeRecs] No rows from get_time_segment_bandit_inputs");
     return [];
   }
 
-  const rows: TimeSegmentBanditRow[] = data;
+  function sampleBeta(alpha: number | null, beta: number | null): number {
+    const a = Math.max(alpha ?? 1, 1e-3);
+    const b = Math.max(beta ?? 1, 1e-3);
 
-  if (rows.length === 0) return [];
+    // simple Beta(α,β) sampler via two Gamma(α,1), Gamma(β,1) approximations
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const x = Math.pow(u1, 1 / a);
+    const y = Math.pow(u2, 1 / b);
+    return x / (x + y);
+  }
 
-  const scored: TimeSegmentRecommendation[] = rows.map((row) => {
-    const predicted = row.predicted_avg ?? 0;
+  const recs: TimeSegmentRecommendation[] = rows.map((r) => {
+    const modelScore = r.predicted_avg ?? 0;
+    const theta = sampleBeta(r.bandit_alpha, r.bandit_beta);
 
-    // Numeric from Postgres can sometimes come back as string → coerce
-    const alpha = row.bandit_alpha != null ? Number(row.bandit_alpha) : 1;
-    const beta  = row.bandit_beta  != null ? Number(row.bandit_beta)  : 1;
-
-    let theta: number;
-    try {
-      theta = sampleBeta(alpha, beta);
-    } catch {
-      theta = alpha > 0 && beta > 0 ? alpha / (alpha + beta) : 0.5;
-    }
-
-    const hybridSample = weightModel * predicted + weightBandit * theta;
+    const hybridSample = weightModel * modelScore + weightBandit * theta;
 
     return {
-      ...row,
-      theta,
+      platform: "facebook",
+      timeslot: r.timeslot,
+      dow: r.dow,
+      hour: r.hour,
+      segment_id: r.segment_id,
+      predicted_avg: r.predicted_avg,
+      bandit_alpha: r.bandit_alpha,
+      bandit_beta: r.bandit_beta,
       hybridSample,
+      sample_count: r.sample_count ?? null,
     };
   });
 
-  scored.sort((a, b) => b.hybridSample - a.hybridSample);
-
-  return scored;
+  console.log("[timeRecs] Final rec count:", recs.length);
+  return recs.sort((a, b) => b.hybridSample - a.hybridSample);
 }

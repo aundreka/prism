@@ -1,4 +1,8 @@
 // app/(tabs)/posts.tsx
+import { supabase } from "@/lib/supabase";
+import { FontAwesome } from "@expo/vector-icons";
+import { useFocusEffect } from "@react-navigation/native";
+import { router } from "expo-router";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -9,10 +13,6 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { FontAwesome } from "@expo/vector-icons";
-import { supabase } from "@/lib/supabase";
-import { router } from "expo-router";
-import { useFocusEffect } from "@react-navigation/native";
 
 type PlatformEnum = "facebook" | "instagram";
 type PostStatusEnum =
@@ -30,6 +30,7 @@ type PostRow = {
   post_type: string;
   created_at: string;
 };
+
 type ScheduledRow = {
   id: string;
   post_id: string | null;
@@ -38,7 +39,10 @@ type ScheduledRow = {
   api_post_id: string | null;
   scheduled_at: string | null;
   posted_at: string | null;
+  page_id: string | null;
+  target_id: string;
 };
+
 type MetricEnum =
   | "impressions"
   | "reach"
@@ -51,10 +55,19 @@ type MetricEnum =
   | "clicks"
   | "video_views"
   | "engagement";
+
 type AnalyticsRow = {
   object_id: string | null;
   metric: MetricEnum;
   value: number;
+};
+
+// Connected pages / IG accounts (for multi-page support)
+type MetaAccount = {
+  platform: PlatformEnum;
+  page_id: string | null;
+  ig_user_id: string | null;
+  is_active: boolean | null;
 };
 
 const BG = "#F8FAFC";
@@ -74,9 +87,11 @@ const ALL_STATUS: PostStatusEnum[] = [
 
 export default function PostsScreen() {
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [posts, setPosts] = useState<PostRow[]>([]);
   const [sched, setSched] = useState<ScheduledRow[]>([]);
   const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
+  const [accounts, setAccounts] = useState<MetaAccount[]>([]);
 
   const [activeStatuses, setActiveStatuses] = useState<PostStatusEnum[]>([
     "scheduled",
@@ -88,87 +103,162 @@ export default function PostsScreen() {
   ]);
   const [showFilters, setShowFilters] = useState(false);
 
-  const loadData = useCallback(async () => {
-    try {
-      setLoading(true);
+  const loadData = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent ?? false;
 
-      const { data } = await supabase.auth.getUser();
-      const user = data?.user;
-      if (!user) {
-        Alert.alert("Sign in required", "Please sign in.");
-        setPosts([]);
-        setSched([]);
-        setAnalytics([]);
-        return;
+      try {
+        if (!silent) setLoading(true);
+
+        // Get user
+        const { data } = await supabase.auth.getUser();
+        const user = data?.user;
+        if (!user) {
+          Alert.alert("Sign in required", "Please sign in.");
+          setPosts([]);
+          setSched([]);
+          setAnalytics([]);
+          setAccounts([]);
+          return;
+        }
+
+        // 1) Load connected accounts (multi-page)
+        const { data: accData, error: accErr } = await supabase
+          .from("connected_meta_accounts")
+          .select("platform,page_id,ig_user_id,is_active")
+          .eq("user_id", user.id);
+
+        if (accErr) throw accErr;
+
+        const accs = (accData || []) as MetaAccount[];
+        setAccounts(accs);
+
+        // 2) Compute active target IDs (like drafts, but multi-platform aware)
+        //    For FB: use page_id; for IG: use ig_user_id.
+        const activeTargets = new Set<string>();
+        for (const acc of accs) {
+          if (!acc.is_active) continue;
+          if (acc.platform === "facebook" && acc.page_id) {
+            activeTargets.add(acc.page_id);
+          }
+          if (acc.platform === "instagram" && acc.ig_user_id) {
+            activeTargets.add(acc.ig_user_id);
+          }
+        }
+
+        // If there is NO active page/account → no posts for a specific page
+        // (same behavior as DraftsScreen)
+        if (activeTargets.size === 0) {
+          setPosts([]);
+          setSched([]);
+          setAnalytics([]);
+          return;
+        }
+
+        // 3) Load posts for this user (we'll later trim to page-owned posts)
+        const { data: p, error: e1 } = await supabase
+          .from("posts")
+          .select("id,user_id,caption,post_type,created_at")
+          .eq("user_id", user.id)
+          .order("created_at", { ascending: false })
+          .limit(200);
+
+        if (e1) throw e1;
+
+        const postsData = (p || []) as PostRow[];
+        if (postsData.length === 0) {
+          setPosts([]);
+          setSched([]);
+          setAnalytics([]);
+          return;
+        }
+
+        setPosts(postsData);
+
+        // 4) Load scheduled_posts for these posts
+        const postIds = postsData.map((x) => x.id);
+        const { data: s, error: e2 } = await supabase
+          .from("scheduled_posts")
+          .select(
+            "id,post_id,status,platform,api_post_id,scheduled_at,posted_at,page_id,target_id"
+          )
+          .in("post_id", postIds)
+          .order("scheduled_at", { ascending: false });
+
+        if (e2) throw e2;
+
+        let schedData = (s || []) as ScheduledRow[];
+
+        // 5) Keep ONLY schedules that belong to the active page(s)/accounts.
+        //    We *do not* keep legacy rows with no page/target info anymore,
+        //    because we want strict page ownership (like drafts).
+        schedData = schedData.filter((row) => {
+          const candidates: string[] = [];
+          if (row.page_id) candidates.push(row.page_id);
+          if (row.target_id) candidates.push(row.target_id);
+
+          if (candidates.length === 0) {
+            // No page info → treat as "not owned" by the active page.
+            return false;
+          }
+          return candidates.some((id) => activeTargets.has(id));
+        });
+
+        setSched(schedData);
+
+        // If no schedules survived, then effectively this page has no posts.
+        if (schedData.length === 0) {
+          setAnalytics([]);
+          return;
+        }
+
+        // 6) Analytics: only for those kept schedules (page-owned)
+        const apiIds = schedData
+          .map((x) => x.api_post_id)
+          .filter((x): x is string => !!x);
+
+        if (apiIds.length) {
+          const { data: a, error: e3 } = await supabase
+            .from("analytics_events")
+            .select("object_id,metric,value")
+            .in("object_id", apiIds);
+
+          if (e3) throw e3;
+
+          setAnalytics((a || []) as AnalyticsRow[]);
+        } else {
+          setAnalytics([]);
+        }
+      } catch (e: any) {
+        console.error(e);
+        Alert.alert("Error", e?.message ?? "Failed to load posts.");
+      } finally {
+        if (!silent) setLoading(false);
+        setRefreshing(false);
       }
+    },
+    []
+  );
 
-      const { data: p, error: e1 } = await supabase
-        .from("posts")
-        .select("id,user_id,caption,post_type,created_at")
-        .eq("user_id", user.id)
-        .order("created_at", { ascending: false })
-        .limit(200);
-
-      if (e1) throw e1;
-
-      const postsData = (p || []) as PostRow[];
-      setPosts(postsData);
-
-      if (postsData.length === 0) {
-        setSched([]);
-        setAnalytics([]);
-        return;
-      }
-
-      const postIds = postsData.map((x) => x.id);
-      const { data: s, error: e2 } = await supabase
-        .from("scheduled_posts")
-        .select("id,post_id,status,platform,api_post_id,scheduled_at,posted_at")
-        .in("post_id", postIds)
-        .order("scheduled_at", { ascending: false });
-
-      if (e2) throw e2;
-
-      const schedData = (s || []) as ScheduledRow[];
-      setSched(schedData);
-
-      const apiIds = schedData
-        .map((x) => x.api_post_id)
-        .filter((x): x is string => !!x);
-
-      if (apiIds.length) {
-        const { data: a, error: e3 } = await supabase
-          .from("analytics_events")
-          .select("object_id,metric,value")
-          .in("object_id", apiIds);
-
-        if (e3) throw e3;
-
-        setAnalytics((a || []) as AnalyticsRow[]);
-      } else {
-        setAnalytics([]);
-      }
-    } catch (e: any) {
-      console.error(e);
-      Alert.alert("Error", e?.message ?? "Failed to load posts.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  // Pull-to-refresh
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    loadData({ silent: true });
+  }, [loadData]);
 
   // Initial load
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Reload whenever the screen comes into focus (so new drafts show up)
+  // Reload on focus
   useFocusEffect(
     useCallback(() => {
-      loadData();
+      loadData({ silent: true });
     }, [loadData])
   );
 
-  // Groupings
+  // Group schedules by post (already page-filtered)
   const schedByPost = useMemo(() => {
     const map = new Map<string, ScheduledRow[]>();
     for (const s of sched) {
@@ -185,31 +275,27 @@ export default function PostsScreen() {
       if (!a.object_id) continue;
       if (!map.has(a.object_id)) map.set(a.object_id, {});
       const bucket = map.get(a.object_id)!;
-
-      // Use the highest snapshot value for each metric per object_id
       const val = Number(a.value) || 0;
       bucket[a.metric] = Math.max(bucket[a.metric] || 0, val);
     }
     return map;
   }, [analytics]);
 
-  // Filter predicate – considers ALL platforms (FB + IG)
+  // Only show posts that:
+  //  - Have at least one schedule row (for the active page/account), AND
+  //  - Have at least one schedule with a status matching filters.
   const filteredPosts = useMemo(() => {
     return posts.filter((p) => {
       const srows = schedByPost.get(p.id) || [];
 
-      // If no schedules at all, treat as draft-only visibility controlled by status filter
-      if (srows.length === 0) {
-        return activeStatuses.includes("draft");
-      }
+      // No schedules attached to the active page ⇒ this page didn't "make" this post.
+      if (srows.length === 0) return false;
 
-      // Include post if ANY schedule (any platform) matches the selected statuses
       return srows.some((s) => activeStatuses.includes(s.status));
     });
   }, [posts, schedByPost, activeStatuses]);
 
   function summarizePostAnalytics(postId: string) {
-    // Use ALL platforms for analytics
     const srows = schedByPost.get(postId) || [];
     const apiIds = srows
       .map((x) => x.api_post_id)
@@ -233,11 +319,18 @@ export default function PostsScreen() {
       saves += b["saves"] || 0;
       videoViews += b["video_views"] || 0;
     }
-    return { engagement, impressions, likes, comments, shares, saves, videoViews };
+    return {
+      engagement,
+      impressions,
+      likes,
+      comments,
+      shares,
+      saves,
+      videoViews,
+    };
   }
 
   function summarizeStatuses(postId: string) {
-    // Use ALL platforms for statuses
     const srows = schedByPost.get(postId) || [];
     const counts: Record<PostStatusEnum, number> = {
       draft: 0,
@@ -262,7 +355,7 @@ export default function PostsScreen() {
     );
   }
 
-  if (loading) {
+  if (loading && !refreshing) {
     return (
       <View
         style={[
@@ -338,7 +431,7 @@ export default function PostsScreen() {
 
       {filteredPosts.length === 0 ? (
         <Text style={{ color: MUTED, marginTop: 8 }}>
-          No posts matching filters.
+          No posts for this page matching the filters.
         </Text>
       ) : (
         <FlatList
@@ -346,6 +439,8 @@ export default function PostsScreen() {
           keyExtractor={(i) => i.id}
           contentContainerStyle={{ paddingBottom: 32 }}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          refreshing={refreshing}
+          onRefresh={onRefresh}
           renderItem={({ item }) => {
             const created = new Date(item.created_at).toLocaleString([], {
               month: "short",

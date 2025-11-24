@@ -29,13 +29,7 @@ const HEADER_SPACER = 140;
 const FOOTER_SPACER = 80;
 
 type PlatformEnum = "facebook";
-type PostTypeEnum =
-  | "image"
-  | "video"
-  | "reel"
-  | "story"
-  | "carousel"
-  | "link";
+type PostTypeEnum = "image" | "video" | "reel" | "story" | "carousel" | "link";
 type PostStatusEnum =
   | "draft"
   | "scheduled"
@@ -53,6 +47,7 @@ type DraftRow = {
   created_at: string;
   scheduled_at: string | null;
   media_ids: string[];
+  page_id: string | null;
 };
 
 type MediaAsset = {
@@ -82,6 +77,7 @@ export default function DraftsScreen() {
   const loadDrafts = useCallback(
     async (opts: { quiet?: boolean } = {}) => {
       try {
+        // Ensure we have a user_id
         if (!uid) {
           const { data } = await supabase.auth.getUser();
           const user = data?.user;
@@ -92,24 +88,61 @@ export default function DraftsScreen() {
           }
           setUid(user.id);
         }
-        const userId = uid || (await supabase.auth.getUser()).data?.user?.id;
+
+        const { data: userData } = await supabase.auth.getUser();
+        const userId = uid || userData?.user?.id;
         if (!userId) return;
 
         if (!opts.quiet) setLoading(true);
 
-        // 1) fetch drafts from view
-        const { data: rows, error } = await supabase
+        // 1) Find the active page for this user+platform
+        const { data: activePage, error: activeErr } = await supabase
+          .from("connected_meta_accounts")
+          .select("page_id")
+          .eq("user_id", userId)
+          .eq("platform", "facebook")
+          .eq("is_active", true)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (activeErr) {
+          console.error("Error loading active page:", activeErr);
+          Alert.alert(
+            "Error",
+            activeErr.message ?? "Failed to load active page."
+          );
+          setDrafts([]);
+          return;
+        }
+
+        const activePageId = activePage?.page_id ?? null;
+
+        if (!activePageId) {
+          // No active page → no drafts for a specific page
+          setDrafts([]);
+          return;
+        }
+
+        // 2) Fetch drafts from view, scoped to this active page
+        let query = supabase
           .from("v_scheduled_posts_with_media")
           .select(
-            "id, user_id, caption, post_type, status, created_at, scheduled_at, media_ids"
+            "id, user_id, caption, post_type, status, created_at, scheduled_at, media_ids, page_id"
           )
           .eq("user_id", userId)
           .eq("status", "draft")
           .order("created_at", { ascending: false });
 
+        // Only drafts for the active page
+        query = query.eq("page_id", activePageId);
+
+        const { data: rows, error } = await query;
+
         if (error) throw error;
 
         const draftsData = (rows || []) as any[];
+
         setDrafts(
           draftsData.map((r) => ({
             id: r.id,
@@ -120,15 +153,17 @@ export default function DraftsScreen() {
             created_at: r.created_at,
             scheduled_at: r.scheduled_at,
             media_ids: (r.media_ids || []) as string[],
+            page_id: r.page_id ?? null,
           }))
         );
 
-        // 2) fetch media assets in one go
+        // 3) Fetch media assets in one go
         const allMediaIds = Array.from(
           new Set(
             draftsData.flatMap((r) => ((r.media_ids || []) as string[]))
           )
         );
+
         if (allMediaIds.length) {
           const { data: mediaRows, error: mediaErr } = await supabase
             .from("media_assets")
@@ -174,44 +209,38 @@ export default function DraftsScreen() {
     loadDrafts({ quiet: true });
   }, [loadDrafts]);
 
-  const handleDeleteDraft = useCallback(
-    (draft: DraftRow) => {
-      Alert.alert(
-        "Delete draft?",
-        "This will permanently delete this draft. This can't be undone.",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Delete",
-            style: "destructive",
-            onPress: async () => {
-              try {
-                setDeletingId(draft.id);
-                const { error } = await supabase
-                  .from("scheduled_posts")
-                  .delete()
-                  .eq("id", draft.id);
+  const handleDeleteDraft = useCallback((draft: DraftRow) => {
+    Alert.alert(
+      "Delete draft?",
+      "This will permanently delete this draft. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setDeletingId(draft.id);
+              const { error } = await supabase
+                .from("scheduled_posts")
+                .delete()
+                .eq("id", draft.id);
 
-                if (error) throw error;
+              if (error) throw error;
 
-                // Optimistic update
-                setDrafts((prev) => prev.filter((d) => d.id !== draft.id));
-              } catch (e: any) {
-                console.error("Error deleting draft:", e);
-                Alert.alert(
-                  "Error",
-                  e?.message ?? "Failed to delete draft."
-                );
-              } finally {
-                setDeletingId(null);
-              }
-            },
+              // Optimistic update
+              setDrafts((prev) => prev.filter((d) => d.id !== draft.id));
+            } catch (e: any) {
+              console.error("Error deleting draft:", e);
+              Alert.alert("Error", e?.message ?? "Failed to delete draft.");
+            } finally {
+              setDeletingId(null);
+            }
           },
-        ]
-      );
-    },
-    []
-  );
+        },
+      ]
+    );
+  }, []);
 
   const renderDraft = ({ item }: { item: DraftRow }) => {
     const firstMediaId = item.media_ids?.[0];

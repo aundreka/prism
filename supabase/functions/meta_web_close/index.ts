@@ -38,24 +38,8 @@ function parseTarget(raw: string | null): { target: string; scheme: string } {
   return { target: t, scheme };
 }
 
-/** Primary: send a 302 Location for immediate redirect attempts */
-function httpRedirect(to: string) {
-  return new Response("Redirecting…", {
-    status: 302,
-    headers: {
-      Location: to,
-      // Security / UX headers
-      "Referrer-Policy": "no-referrer",
-      "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy":
-        "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none';",
-      "Cache-Control": "no-store, max-age=0",
-    },
-  });
-}
-
 /** Fallback HTML with multiple client-side strategies */
-function fallbackHtml(body: string) {
+function htmlResponse(body: string) {
   return new Response(body, {
     status: 200,
     headers: {
@@ -79,11 +63,11 @@ Deno.serve((req) => {
 
   /**
    * Strategy:
-   * 1) Send a 302 Location first — many mobile browsers will honor custom schemes.
-   * 2) For cases that ignore 302 to custom schemes, also return an HTML body with
-   *    robust client-side fallbacks (meta refresh, JS replace, hidden iframe, Android intent).
-   *
-   * Note: returning a body with a 302 is allowed and improves compatibility.
+   * - Return a 200 HTML page (NOT a 302) so Safari / FB webview don't
+   *   try to "open" the custom scheme as a normal URL and show an error.
+   * - Use JS + optional Android intent + hidden iframe to trigger the deep link.
+   * - Your auth session / in-app browser should auto-close when it sees
+   *   navigation to prism://... (or exp://...).
    */
   const page = `<!doctype html>
 <html lang="en">
@@ -91,11 +75,17 @@ Deno.serve((req) => {
   <meta charset="utf-8" />
   <title>Returning to App…</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Meta refresh kept, but this is now on a 200 page, not a 302 -->
   <meta http-equiv="refresh" content="0; url=${esc(target)}">
   <style>
     :root{color-scheme:light dark}
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;background:#fff;color:#0f172a}
-    @media (prefers-color-scheme: dark){ body{background:#0b0f19;color:#e5e7eb} .card{border-color:#273043} .btn{background:#2563eb} code{background:#111827;color:#e5e7eb} }
+    @media (prefers-color-scheme: dark){
+      body{background:#0b0f19;color:#e5e7eb}
+      .card{border-color:#273043}
+      .btn{background:#2563eb}
+      code{background:#111827;color:#e5e7eb}
+    }
     .card{max-width:520px;margin:40px auto;padding:20px;border:1px solid #e5e7eb;border-radius:16px}
     .muted{color:#6b7280}
     .btn{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:12px;background:#111827;color:#fff;text-decoration:none}
@@ -106,7 +96,11 @@ Deno.serve((req) => {
 <body>
   <div class="card">
     <h2>${error ? "Unable to complete sign-in" : "Connecting…"}</h2>
-    ${error ? `<p class="muted"><code>${error}</code></p>` : `<p class="muted">We're returning you to the app now.</p>`}
+    ${
+      error
+        ? `<p class="muted"><code>${error}</code></p>`
+        : `<p class="muted">We're returning you to the app now.</p>`
+    }
     <p class="small muted">If nothing happens, tap this:</p>
     <p><a class="btn" id="open" href="${esc(target)}">Open App</a></p>
   </div>
@@ -114,6 +108,14 @@ Deno.serve((req) => {
   <script>
     (function(){
       var target = ${JSON.stringify(target)};
+
+      // 0) If we're inside a React Native WebView, signal the app to close
+      try {
+        if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: "oauth_complete", target: target }));
+        }
+      } catch (e) {}
+
       // 1) Immediate replace
       try { window.location.replace(target); } catch(e) {}
 
@@ -123,7 +125,13 @@ Deno.serve((req) => {
       }, 250);
 
       // 3) Android intent for Expo if needed
-      ${androidIntent ? `setTimeout(function(){ try { window.location.href = ${JSON.stringify(androidIntent)}; } catch(e) {} }, 650);` : ""}
+      ${
+        androidIntent
+          ? `setTimeout(function(){ try { window.location.href = ${JSON.stringify(
+              androidIntent,
+            )}; } catch(e) {} }, 650);`
+          : ""
+      }
 
       // 4) Hidden iframe trick (older WebViews / Safari)
       setTimeout(function(){
@@ -134,15 +142,18 @@ Deno.serve((req) => {
           document.body.appendChild(ifr);
         } catch(e) {}
       }, 1000);
+
+      // 5) As a final fallback, try to close the window (works in some WebViews)
+      setTimeout(function(){
+        try { window.close(); } catch (e) {}
+      }, 1500);
     })();
   </script>
 </body>
 </html>`;
 
-  // Send 302 with body (best of both worlds)
-  const res = httpRedirect(androidIntent ?? target);
-  return new Response(page, {
-    status: res.status,
-    headers: res.headers,
-  });
+  // IMPORTANT CHANGE:
+  // We no longer send a 302 Location to the custom scheme.
+  // Just return the HTML page and let JS / meta-refresh handle it.
+  return htmlResponse(page);
 });

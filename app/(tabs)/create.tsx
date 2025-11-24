@@ -24,6 +24,7 @@ import {
   TextInput,
   TouchableOpacity,
   View,
+  RefreshControl,
 } from "react-native";
 
 /* -------------------------
@@ -174,6 +175,7 @@ type ConnectedMeta = {
   ig_username: string | null;
   access_token: string;
   token_expires_at: string | null;
+  is_active: boolean | null;
 };
 
 /* -------------------------
@@ -196,7 +198,7 @@ const OBJECTIVE_OPTIONS: {
   },
   {
     key: "conversion",
-    label: "Sales / Conversion",
+    label: "Conversion",
     subtitle: "Clicks, inquiries, purchases",
   },
 ];
@@ -237,6 +239,7 @@ export default function CreateScreen() {
   const [uid, setUid] = useState<string | null>(null);
   const [connections, setConnections] = useState<ConnectedMeta[]>([]);
   const [loadingConn, setLoadingConn] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
   // brand industry (from brand_profiles)
   const [industry, setIndustry] = useState<string | null>(null);
@@ -253,6 +256,11 @@ export default function CreateScreen() {
     }>
   >([]);
   const [croppingIndex, setCroppingIndex] = useState<number | null>(null);
+
+  // 🔵 Track existing media IDs when editing a draft
+  const [existingMediaIds, setExistingMediaIds] = useState<string[] | null>(
+    null
+  );
 
   // dateTimes start empty; we'll sync from calendar param via effect
   const [dateTimes, setDateTimes] = useState<Date[]>([]);
@@ -304,54 +312,78 @@ export default function CreateScreen() {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // Fetch user + connections + brand_profiles.industry
-  useEffect(() => {
-    (async () => {
-      try {
-        const { data } = await supabase.auth.getUser();
-        const user = data?.user;
-        if (!user) {
-          Alert.alert("Sign in required", "Please log in to create posts.");
-          router.replace("/(auth)");
-          return;
-        }
-        setUid(user.id);
-
-        setLoadingConn(true);
-
-        // Connected accounts
-        const { data: conn, error: connErr } = await supabase
-          .from("connected_meta_accounts")
-          .select(
-            "id,user_id,platform,page_id,page_name,ig_user_id,ig_username,access_token,token_expires_at"
-          )
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false });
-
-        if (connErr) throw connErr;
-        setConnections((conn || []) as any);
-
-        // Brand profile industry from brand_profiles
-        const { data: bp, error: bpErr } = await supabase
-          .from("brand_profiles")
-          .select("industry")
-          .eq("user_id", user.id)
-          .maybeSingle();
-
-        if (!bpErr && bp) {
-          setIndustry(bp.industry ?? null);
-        }
-      } catch (e) {
-        console.error(e);
-      } finally {
-        setLoadingConn(false);
+  /* -------------------------
+     Fetch user + connections + brand_profiles.industry
+  --------------------------*/
+  const loadUserAndMeta = useCallback(async () => {
+    try {
+      setLoadingConn(true);
+      const { data } = await supabase.auth.getUser();
+      const user = data?.user;
+      if (!user) {
+        Alert.alert("Sign in required", "Please log in to create posts.");
+        router.replace("/(auth)");
+        return;
       }
-    })();
+      setUid(user.id);
+
+      // Connected accounts (include is_active so we can respect active page)
+      const { data: conn, error: connErr } = await supabase
+        .from("connected_meta_accounts")
+        .select(
+          "id,user_id,platform,page_id,page_name,ig_user_id,ig_username,access_token,token_expires_at,is_active"
+        )
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: false });
+
+      if (connErr) throw connErr;
+      setConnections((conn || []) as any);
+
+      // Brand profile industry from brand_profiles
+      const { data: bp, error: bpErr } = await supabase
+        .from("brand_profiles")
+        .select("industry")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      if (!bpErr && bp) {
+        setIndustry(bp.industry ?? null);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingConn(false);
+    }
   }, []);
 
-  const connectedFB = useMemo(
-    () => connections.find((c) => c.platform === "facebook" && c.page_id),
+  useEffect(() => {
+    loadUserAndMeta();
+  }, [loadUserAndMeta]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await loadUserAndMeta();
+    setRefreshing(false);
+  }, [loadUserAndMeta]);
+
+  /* -------------------------
+     Connection selection (respect active page)
+  --------------------------*/
+  const activeFB = useMemo(
+    () =>
+      connections.find(
+        (c) => c.platform === "facebook" && !!c.page_id && !!c.is_active
+      ),
     [connections]
+  );
+
+  const connectedFB = useMemo(
+    () =>
+      activeFB ||
+      connections.find(
+        (c) => c.platform === "facebook" && !!c.page_id
+      ),
+    [activeFB, connections]
   );
 
   const canCreateAtAll = !!connectedFB;
@@ -452,6 +484,8 @@ export default function CreateScreen() {
 
         // Media
         const mediaIds: string[] = (draft.media_ids as string[]) || [];
+        setExistingMediaIds(mediaIds.length ? mediaIds : []); // 🔵 store existing ids
+
         if (mediaIds.length) {
           const { data: mediaRows, error: mediaErr } = await supabase
             .from("media_assets")
@@ -537,6 +571,11 @@ export default function CreateScreen() {
         (a.type?.includes("video") ? "video/mp4" : "image/jpeg"),
     }));
     setMediaLocal((prev) => [...prev, ...mapped]);
+    // Newly picked media have no existing IDs yet
+    setExistingMediaIds((prev) => {
+      const extra = new Array(mapped.length).fill(null);
+      return prev ? [...prev, ...extra] : extra;
+    });
   }, []);
 
   /* -------------------------
@@ -583,6 +622,15 @@ export default function CreateScreen() {
         mimeType: "image/jpeg",
       };
       setMediaLocal(updated);
+      // Cropping means the underlying file changed, so clear existing ID at that index (force re-upload)
+      setExistingMediaIds((prev) => {
+        if (!prev) return prev;
+        const copy = [...prev];
+        if (copy[croppingIndex] != null) {
+          copy[croppingIndex] = null;
+        }
+        return copy;
+      });
     },
     [croppingIndex, mediaLocal]
   );
@@ -590,6 +638,9 @@ export default function CreateScreen() {
   const removeMedia = useCallback(
     (idx: number) => {
       setMediaLocal((prev) => prev.filter((_, i) => i !== idx));
+      setExistingMediaIds((prev) =>
+        prev ? prev.filter((_, i) => i !== idx) : prev
+      );
       if (croppingIndex === idx) setCroppingIndex(null);
     },
     [croppingIndex]
@@ -679,9 +730,21 @@ export default function CreateScreen() {
 
       setSubmitting(true);
 
-      // Upload media
+      // Upload / reuse media
       const mediaIds: string[] = [];
-      for (const m of mediaLocal) {
+      for (let i = 0; i < mediaLocal.length; i++) {
+        const m = mediaLocal[i];
+        const existingId = existingMediaIds?.[i] ?? null;
+        const isRemote =
+          m.uri.startsWith("http://") || m.uri.startsWith("https://");
+
+        if (existingId && isRemote) {
+          // Draft media already in Supabase; just reuse its ID
+          mediaIds.push(existingId);
+          continue;
+        }
+
+        // New or modified media → upload
         const { path, publicUrl } = await uploadToBucket(
           uid,
           m.uri,
@@ -745,6 +808,14 @@ export default function CreateScreen() {
           method: "POST",
         }).catch(() => {});
       }
+
+      // 🔵 AFTER SUCCESS: clear form state but KEEP the angle
+      setCaption("");
+      setMediaLocal([]);
+      setExistingMediaIds(null);
+      setDateTimes([]);
+      setCroppingIndex(null);
+      setVideoPostKind("reel");
 
       Alert.alert(
         "Success",
@@ -814,7 +885,7 @@ export default function CreateScreen() {
   /* -------------------------
      Render
   --------------------------*/
-  if (loadingConn) {
+  if (loadingConn && !refreshing) {
     return (
       <View
         style={[
@@ -833,13 +904,22 @@ export default function CreateScreen() {
       style={styles.container}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      <ScrollView contentContainerStyle={styles.content}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor={TINT}
+          />
+        }
+      >
         {/* Top bar: title + drafts + connect warning */}
         <View style={styles.topBar}>
           <Text style={styles.title}>Create</Text>
           <TouchableOpacity
             style={styles.draftsBtn}
-            onPress={() => router.push('/post/drafts')}
+            onPress={() => router.push("/post/drafts")}
             activeOpacity={0.9}
           >
             <FontAwesome name="file-text-o" size={12} color={TINT} />

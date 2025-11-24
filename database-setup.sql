@@ -70,10 +70,67 @@ create table if not exists public.connected_meta_accounts (
   ig_username text,
   access_token text not null,
   token_expires_at timestamptz,
+  user_access_token text,
+  user_token_expires_at timestamptz,
+  is_active BOOLEAN default true,
   scopes text[],
   created_at timestamptz not null default now_utc(),
   updated_at timestamptz not null default now_utc()
 );
+
+create unique index if not exists uq_cma_user_platform_page
+  on public.connected_meta_accounts(user_id, platform, page_id);
+
+create unique index if not exists uq_cma_user_platform_active
+  on public.connected_meta_accounts(user_id, platform)
+  where is_active = true;
+
+create or replace function public.set_active_meta_page(
+  p_user_id uuid,
+  p_platform platform_enum,
+  p_page_id text
+)
+returns void
+language plpgsql
+as $$
+declare
+  v_target_id uuid;
+begin
+  -- Lock rows for this user+platform to avoid race conditions
+  perform 1
+  from public.connected_meta_accounts
+  where user_id = p_user_id
+    and platform = p_platform
+  for update;
+
+  -- Pick the target row to activate (latest if there are accidental dupes)
+  select id
+  into v_target_id
+  from public.connected_meta_accounts
+  where user_id = p_user_id
+    and platform = p_platform
+    and page_id = p_page_id
+  order by created_at desc
+  limit 1;
+
+  if v_target_id is null then
+    -- No such page; nothing to do (your Edge function already checks this)
+    return;
+  end if;
+
+  -- 1) Turn everything OFF for that user+platform
+  update public.connected_meta_accounts
+  set is_active = false
+  where user_id = p_user_id
+    and platform = p_platform;
+
+  -- 2) Turn only the chosen row ON
+  update public.connected_meta_accounts
+  set is_active = true
+  where id = v_target_id;
+end;
+$$;
+
 create index if not exists idx_cma_user_platform on public.connected_meta_accounts(user_id, platform);
 create index if not exists idx_cma_token_expiry on public.connected_meta_accounts((token_expires_at));
 
@@ -161,6 +218,7 @@ create table if not exists public.scheduled_posts (
   platform platform_enum not null,
   target_id text not null,
   post_id uuid references public.posts(id) on delete set null,
+  page_id text,
   caption text,
   post_type post_type_enum not null default 'image',
   status post_status_enum not null default 'draft',
@@ -169,6 +227,7 @@ create table if not exists public.scheduled_posts (
   posted_at timestamptz,
   api_post_id text,
   permalink text,
+  attempts int default 0,
   error_message text,
     objective text,
   angle text,
@@ -182,16 +241,6 @@ drop trigger if exists trg_sched_updated on public.scheduled_posts;
 create trigger trg_sched_updated before update on public.scheduled_posts
 for each row execute function set_updated_at();
 
--- If an earlier run created scheduled_posts.media_ids (uuid[]) drop it
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema='public' and table_name='scheduled_posts' and column_name='media_ids'
-  ) then
-    alter table public.scheduled_posts drop column media_ids;
-  end if;
-end$$;
 
 -- PARTIAL UNIQUE (dedupe accidental double schedules while pending)
 create unique index if not exists uq_scheduled_dedup
@@ -252,6 +301,7 @@ create index if not exists idx_sched_media_sched_pos
 create table if not exists public.analytics_events (
   id bigserial primary key,
   user_id uuid not null references auth.users(id) on delete cascade,
+  page_id text,
   platform platform_enum not null,
   object_id text,
   metric metric_enum not null,
@@ -661,32 +711,21 @@ create index if not exists idx_feats_dow_hour on public.features_engagement_time
 create or replace view public.v_user_recent_engagement as
 select
   user_id,
+  page_id,
   platform,
   date_trunc('day', ts) as day,
-  sum(case when metric = 'engagement' then value else 0 end) as engagement,
-  sum(case when metric = 'impressions' then value else 0 end) as impressions
+
+  -- engagement = likes + comments + shares (synthetic engagement is fine too)
+  sum(
+    case
+      when metric in ('likes', 'comments', 'shares', 'engagement')
+      then value
+      else 0
+    end
+  ) as engagement
+
 from public.v_analytics_events_all
-group by 1,2,3;
-
-create or replace view public.v_best_time_slots as
-select
-  user_id, platform, dow, hour,
-  avg(label_engagement) as predicted_avg
-from public.features_engagement_timeslots
-group by 1,2,3,4
-order by predicted_avg desc;
-
--- Media-as-array helper views (ordered)
-create or replace view public.v_posts_with_media as
-select
-  p.*,
-  coalesce(
-    (select array_agg(pm.media_id order by pm.position)
-     from public.posts_media pm
-     where pm.post_id = p.id),
-    '{}'
-  ) as media_ids
-from public.posts p;
+group by user_id, page_id, platform, date_trunc('day', ts);
 
 create or replace view public.v_scheduled_posts_with_media as
 select
@@ -694,6 +733,7 @@ select
   sp.user_id,
   sp.platform,
   sp.target_id,
+  sp.page_id,            -- ✅ expose page_id
   sp.post_id,
   sp.caption,
   sp.post_type,
@@ -1021,76 +1061,107 @@ using (
 -- =========================
 -- RPC: create_post_with_schedules
 -- Atomic post + schedules writer
-create or replace function public.create_post_with_schedules(
+CREATE OR REPLACE FUNCTION public.create_post_with_schedules(
   p_user_id uuid,
   p_caption text,
   p_post_type post_type_enum,
-  p_media_ids uuid[],                 -- ordered
-  p_platforms platform_enum[],        -- same length as p_target_ids
-  p_target_ids text[],                -- 1-1 with platforms
-  p_status post_status_enum,          -- 'draft' for calendar, or 'scheduled'
-  p_scheduled_at timestamptz          -- nullable for plain draft post
-) returns table(post_id uuid, scheduled_ids uuid[])
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_post_id uuid;
+  p_media_ids uuid[],
+  p_platforms platform_enum[],
+  p_target_ids text[],
+  p_status post_status_enum DEFAULT 'draft',
+  p_scheduled_at timestamptz DEFAULT NULL,
+  p_objective text DEFAULT NULL,
+  p_angle text DEFAULT NULL
+)
+RETURNS TABLE (
+  post_id uuid,
+  scheduled_post_ids uuid[]
+) LANGUAGE plpgsql AS $$
+DECLARE
+  v_post_id   uuid;
   v_sched_ids uuid[] := '{}';
-  i int;
-begin
-  -- Enforce caller = owner
-  if p_user_id <> auth.uid() then
-    raise exception 'Forbidden';
-  end if;
+  i           integer;
+BEGIN
+  -- 1) Create base post (now storing objective + angle)
+  INSERT INTO public.posts(
+    user_id,
+    caption,
+    post_type,
+    objective,
+    angle
+  ) VALUES (
+    p_user_id,
+    p_caption,
+    p_post_type,
+    p_objective,
+    p_angle
+  )
+  RETURNING id INTO v_post_id;
 
-  -- 1) Create the post
-  insert into public.posts(user_id, caption, post_type)
-  values (p_user_id, p_caption, p_post_type)
-  returning id into v_post_id;
+  post_id := v_post_id;
 
-  -- 2) Attach ordered media
-  if p_media_ids is not null then
-    insert into public.posts_media(post_id, media_id, position)
-    select v_post_id, mid, idx
-    from unnest(p_media_ids) with ordinality as t(mid, idx);
-  end if;
+  -- 2) Link media to post (ordered)
+  IF p_media_ids IS NOT NULL AND array_length(p_media_ids, 1) > 0 THEN
+    INSERT INTO public.posts_media(post_id, media_id, position)
+    SELECT v_post_id, mid, idx
+    FROM unnest(p_media_ids) WITH ORDINALITY AS t(mid, idx);
+  END IF;
 
-  -- 3) Schedules (optional)
-  if p_platforms is not null and p_target_ids is not null then
-    if array_length(p_platforms,1) <> array_length(p_target_ids,1) then
-      raise exception 'platforms and target_ids length mismatch';
-    end if;
+  -- 3) Create schedules
+  IF p_platforms IS NOT NULL AND p_target_ids IS NOT NULL THEN
+    IF array_length(p_platforms, 1) <> array_length(p_target_ids, 1) THEN
+      RAISE EXCEPTION 'platforms and target_ids length mismatch';
+    END IF;
 
-    for i in 1..coalesce(array_length(p_platforms,1),0) loop
-      declare v_sched_id uuid;
-      begin
-        insert into public.scheduled_posts(
-          user_id, platform, target_id, post_id,
-          caption, post_type, status, scheduled_at
-        ) values (
-          p_user_id, p_platforms[i], p_target_ids[i], v_post_id,
-          p_caption, p_post_type, p_status, p_scheduled_at
-        ) returning id into v_sched_id;
+    FOR i IN 1..array_length(p_platforms, 1) LOOP
+      DECLARE
+        v_sched_id uuid;
+      BEGIN
+        INSERT INTO public.scheduled_posts(
+          user_id,
+          platform,
+          target_id,
+          post_id,
+          page_id,
+          caption,
+          post_type,
+          status,
+          scheduled_at,
+          objective,
+          angle
+        ) VALUES (
+          p_user_id,
+          p_platforms[i],
+          p_target_ids[i],
+          v_post_id,
+          p_target_ids[i], -- pre-fill page_id with target_id
+          p_caption,
+          p_post_type,
+          p_status,
+          p_scheduled_at,
+          p_objective,
+          p_angle
+        )
+        RETURNING id INTO v_sched_id;
 
-        -- link media to scheduled post (preserve order)
-        if p_media_ids is not null then
-          insert into public.scheduled_posts_media(scheduled_post_id, media_id, position)
-          select v_sched_id, mid, idx
-          from unnest(p_media_ids) with ordinality as t(mid, idx);
-        end if;
+        -- Add media to scheduled post (ordered)
+        IF p_media_ids IS NOT NULL AND array_length(p_media_ids, 1) > 0 THEN
+          INSERT INTO public.scheduled_posts_media(scheduled_post_id, media_id, position)
+          SELECT v_sched_id, mid, idx
+          FROM unnest(p_media_ids) WITH ORDINALITY AS t(mid, idx);
+        END IF;
 
         v_sched_ids := array_append(v_sched_ids, v_sched_id);
-      end;
-    end loop;
-  end if;
+      END;
+    END LOOP;
+  END IF;
 
-  return query select v_post_id, v_sched_ids;
-end $$;
+  scheduled_post_ids := v_sched_ids;
+  RETURN NEXT;
+END;
+$$;
 
-alter table public.scheduled_posts
-  add column if not exists attempts int not null default 0;
+
 
 -- atomic failure handler: attempts+1, set status back to 'scheduled' so next tick can retry
 create or replace function public.sp_attempt_fail(p_id uuid, p_message text)
@@ -1162,7 +1233,7 @@ security definer
 set search_path = public
 as $$
   with base as (
-   select
+    select
       f.user_id,
       f.platform,
       f.timeslot,
@@ -1173,9 +1244,11 @@ as $$
       f.post_type,
       f.audience_segment_id               as segment_id
     from public.features_engagement_timeslots f
-    where f.timeslot >= date_trunc('hour', now_utc())
+    where f.user_id   = auth.uid()
+      and f.timeslot >= date_trunc('hour', now_utc())
       and f.timeslot <  date_trunc('hour', now_utc())
                           + (p_horizon_days || ' days')::interval
+      and (p_platform is null or f.platform = p_platform)
   ),
   brand as (
     select
@@ -1215,7 +1288,7 @@ as $$
      and ghp_ind.dow      = b.dow
      and ghp_ind.hour     = b.hour
      and ghp_ind.industry = coalesce(br.industry, 'other'::industry_enum)
-    -- global fallbacks (industry is null)
+    -- global fallbacks (industry = 'other')
     left join public.global_hourly_priors ghp_global
       on ghp_global.platform = b.platform
      and ghp_global.dow      = b.dow
@@ -1233,49 +1306,24 @@ as $$
       s.segment_id,
       s.post_type,
       s.predicted_avg,
-      bp2.context_id,
-      bp2.alpha,
-      bp2.beta,
+      bp.bandit_alpha,
+      bp.bandit_beta,
       case
-        when bp2.context_id is null
-             or (bp2.alpha + bp2.beta) <= 0
+        when bp.bandit_alpha is null
+             or bp.bandit_beta is null
+             or (bp.bandit_alpha + bp.bandit_beta) <= 0
           then s.predicted_avg
         else
           -- blend model prediction + bandit mean
           0.7 * s.predicted_avg
-          + 0.3 * (bp2.alpha::numeric / (bp2.alpha + bp2.beta))
+          + 0.3 * (bp.bandit_alpha::numeric / (bp.bandit_alpha + bp.bandit_beta))
       end as final_score
     from scored s
-    -- pick the best-matching context via lateral join:
-    left join lateral (
-      select
-        bp.context_id,
-        bp.alpha,
-        bp.beta
-      from public.v_bandit_params bp
-      where bp.user_id    = s.user_id
-        and bp.platform   = s.platform
-        and bp.weekday    = s.dow
-        and bp.hour_block = s.hour
-        and (
-             -- exact match on segment + post_type
-             (bp.segment_id is not distinct from s.segment_id
-              and bp.post_type is not distinct from s.post_type)
-          or (bp.segment_id is not distinct from s.segment_id
-              and bp.post_type is null)
-          or (bp.segment_id is null
-              and bp.post_type is not distinct from s.post_type)
-          or (bp.segment_id is null
-              and bp.post_type is null)
-        )
-      order by
-        -- prefer most specific: (segment + post_type) > segment-only/post-type-only > generic
-        (
-          (bp.segment_id is not distinct from s.segment_id)::int +
-          (bp.post_type  is not distinct from s.post_type)::int
-        ) desc
-      limit 1
-    ) bp2 on true
+    left join public.v_bandit_params bp
+      on bp.user_id  = s.user_id
+     and bp.platform = s.platform
+     and bp.dow      = s.dow
+     and bp.hour     = s.hour
   ),
   seg as (
     select
@@ -1295,11 +1343,13 @@ as $$
     coalesce(seg.segment_name, null) as segment_name
   from scored_with_bandit b
   left join seg
-    on seg.user_id   = b.user_id
+    on seg.user_id    = b.user_id
    and seg.segment_id = b.segment_id
+  where b.user_id = auth.uid()
   order by b.final_score desc nulls last, b.timeslot
   limit 20;
 $$;
+
 
 
 create table if not exists public.global_hourly_priors (
@@ -1800,53 +1850,88 @@ create unique index if not exists uq_bandit_rewards_sched
   on public.bandit_rewards(scheduled_post_id)
   where scheduled_post_id is not null;
 
-create view public.v_bandit_params as
+create or replace view public.v_bandit_params as
+with slot_engagement as (
+  select
+    e.user_id,
+    ep.page_id,
+    e.platform,
+    date_trunc('hour', e.ts)                         as slot_hour,
+    extract(dow  from e.ts)::int                     as dow,
+    extract(hour from e.ts)::int                     as hour,
+    -- reward = likes + comments + shares + synthetic engagement if present
+    sum(
+      case
+        when e.metric in ('likes','comments','shares','engagement')
+        then e.value
+        else 0
+      end
+    ) as engagement
+  from public.analytics_events e
+  left join public.external_posts ep
+    on  ep.user_id   = e.user_id
+    and ep.platform  = e.platform
+    and ep.object_id = e.object_id
+  -- only keep rows that belong to the user's *active* page so we don't mix pages
+  left join public.connected_meta_accounts c
+    on  c.user_id   = e.user_id
+    and c.platform  = e.platform
+    and c.page_id   = ep.page_id
+    and c.is_active = true
+  where c.id is not null
+  group by
+    e.user_id,
+    ep.page_id,
+    e.platform,
+    date_trunc('hour', e.ts),
+    extract(dow  from e.ts),
+    extract(hour from e.ts)
+),
+agg as (
+  select
+    user_id,
+    page_id,
+    platform,
+    dow,
+    hour,
+    count(*)                as n,
+    avg(engagement)::float8 as avg_engagement,
+    max(engagement)::float8 as max_engagement
+  from slot_engagement
+  group by user_id, page_id, platform, dow, hour
+),
+norm as (
+  select
+    user_id,
+    page_id,
+    platform,
+    dow,
+    hour,
+    avg_engagement,
+    max_engagement,
+    case
+      when max_platform_page = 0 then 0.0
+      else avg_engagement / max_platform_page
+    end as predicted_avg_norm
+  from (
+    select
+      a.*,
+      max(a.avg_engagement)
+        over (partition by a.user_id, a.page_id, a.platform) as max_platform_page
+    from agg a
+  ) s
+)
 select
-  c.id as context_id,
-  c.user_id,
-  c.platform,
-  c.segment_id,
-  c.post_type,
-  c.weekday,
-  c.hour_block,
-
-  c.prior_success
-    + coalesce(
-        sum(
-          exp(
-            -ln(2)
-            * (extract(epoch from (now_utc() - r.created_at)) / 86400.0)
-            / 30.0
-          ) * r.reward
-        ),
-        0
-      ) as alpha,
-
-  c.prior_failure
-    + coalesce(
-        sum(
-          exp(
-            -ln(2)
-            * (extract(epoch from (now_utc() - r.created_at)) / 86400.0)
-            / 30.0
-          ) * (1 - r.reward)
-        ),
-        0
-      ) as beta
-
-from public.bandit_contexts c
-left join public.bandit_rewards r
-  on r.context_id = c.id
-group by
-  c.id,
-  c.user_id,
-  c.platform,
-  c.segment_id,
-  c.post_type,
-  c.weekday,
-  c.hour_block,
-  c.prior_success,
-  c.prior_failure;
+  user_id,
+  page_id,
+  platform,
+  dow,
+  hour,
+  null::int as segment_id,
+  predicted_avg_norm                                  as predicted_avg,
+  1.0 + greatest(avg_engagement, 0.0)                 as bandit_alpha,
+  1.0 + greatest(max_engagement - avg_engagement,0.0) as bandit_beta
+from norm;
 
 
 
@@ -1945,7 +2030,7 @@ create trigger trg_brand_profiles_updated
 before update on public.brand_profiles
 for each row execute function set_updated_at();
 
-create table if not exists public.content_priors (
+create table if not exists public.   (
   id bigserial primary key,
   industry industry_enum,
   content_type post_type_enum,         -- 'image','video','reel','story','carousel','link'
@@ -2078,95 +2163,111 @@ language sql
 security definer
 set search_path = public
 as $$
-  with base as (
-    select
-      f.user_id,
-      f.platform,
-      f.timeslot,
-      extract(dow  from f.timeslot)::int  as dow,
-      extract(hour from f.timeslot)::int  as hour,
-      f.label_engagement,
-      f.user_recent_avg_7d,
-      f.audience_segment_id               as segment_id
-    from public.features_engagement_timeslots f
-    where f.user_id = auth.uid()
-      and (p_platform is null or f.platform = p_platform)
-      and f.timeslot >= date_trunc('hour', now())
-      and f.timeslot <  date_trunc('hour', now() + make_interval(days => p_horizon_days))
-  ),
-  brand as (
-    select
-      bp.user_id,
-      bp.industry
-    from public.brand_profiles bp
-    where bp.user_id = auth.uid()
-  ),
-  -- Combine per-timeslot label, recent avg, and GLOBAL + INDUSTRY priors
-  scored as (
-    select
-      b.user_id,
-      b.platform,
-      b.timeslot,
-      b.dow,
-      b.hour,
-      b.segment_id,
-      case
-        when b.label_engagement   is not null then b.label_engagement
-        when b.user_recent_avg_7d is not null then b.user_recent_avg_7d
-        else coalesce(
-          ghp_ind.prior_score,   -- industry-specific prior
-          ghp_global.prior_score, -- global prior
-          0
-        )
-      end as predicted_avg
-    from base b
-    left join brand br
-      on br.user_id = b.user_id
-    -- industry-specific priors
-    left join public.global_hourly_priors ghp_ind
-      on ghp_ind.platform = b.platform
-     and ghp_ind.dow      = b.dow
-     and ghp_ind.hour     = b.hour
-     and ghp_ind.industry = coalesce(br.industry, 'other'::industry_enum)
-    -- global fallbacks (industry is null)
-    left join public.global_hourly_priors ghp_global
-      on ghp_global.platform = b.platform
-     and ghp_global.dow      = b.dow
-     and ghp_global.hour     = b.hour
-     and ghp_global.industry is null
-  ),
-  scored_with_bandit as (
-    select
-      s.user_id,
-      s.platform,
-      s.timeslot,
-      s.dow,
-      s.hour,
-      s.segment_id,
-      s.predicted_avg,
-      bp2.alpha as bandit_alpha,
-      bp2.beta  as bandit_beta
-    from scored s
-    left join public.v_bandit_params bp2
-      on bp2.user_id    = s.user_id
-     and bp2.platform   = s.platform
-     and bp2.weekday    = s.dow
-     and bp2.hour_block = s.hour
-  )
+with base_slots as (
+  -- all future hourly slots in the next p_horizon_days
   select
-    platform,
-    timeslot,
-    dow,
-    hour,
-    segment_id,
-    predicted_avg,
-    bandit_alpha,
-    bandit_beta
-  from scored_with_bandit
-  where platform = coalesce(p_platform, platform)
-  order by timeslot
-  limit 200;  -- or whatever
+    t as timeslot,
+    extract(dow  from t)::int  as dow,
+    extract(hour from t)::int  as hour
+  from generate_series(
+    date_trunc('hour', now()),
+    date_trunc('hour', now() + make_interval(days => p_horizon_days)),
+    interval '1 hour'
+  ) t
+),
+user_ctx as (
+  select auth.uid() as user_id
+),
+brand as (
+  select
+    bp.user_id,
+    bp.industry
+  from public.brand_profiles bp
+  join user_ctx u on u.user_id = bp.user_id
+),
+-- optional enrichment from features_engagement_timeslots (may be empty)
+slots_with_features as (
+  select
+    coalesce(f.user_id, u.user_id)                             as user_id,
+    coalesce(f.platform, p_platform, 'facebook'::platform_enum) as platform,
+    bs.timeslot,
+    bs.dow,
+    bs.hour,
+    coalesce(f.audience_segment_id, 0)                         as segment_id,
+    f.label_engagement,
+    f.user_recent_avg_7d
+  from base_slots bs
+  cross join user_ctx u
+  left join public.features_engagement_timeslots f
+    on f.user_id = u.user_id
+   and f.timeslot = bs.timeslot
+   and (p_platform is null or f.platform = p_platform)
+),
+scored as (
+  select
+    s.user_id,
+    s.platform,
+    s.timeslot,
+    s.dow,
+    s.hour,
+    s.segment_id,
+    case
+      when s.label_engagement   is not null then s.label_engagement
+      when s.user_recent_avg_7d is not null then s.user_recent_avg_7d
+      else coalesce(
+        ghp_ind.prior_score,     -- industry-specific prior
+        ghp_global.prior_score,  -- global prior
+        0
+      )
+    end as predicted_avg
+  from slots_with_features s
+  left join brand br
+    on br.user_id = s.user_id
+  -- industry-specific priors
+  left join public.global_hourly_priors ghp_ind
+    on ghp_ind.platform = s.platform
+   and ghp_ind.dow      = s.dow
+   and ghp_ind.hour     = s.hour
+   and ghp_ind.industry = coalesce(br.industry, 'other'::industry_enum)
+  -- global priors (industry is null)
+  left join public.global_hourly_priors ghp_global
+    on ghp_global.platform = s.platform
+   and ghp_global.dow      = s.dow
+   and ghp_global.hour     = s.hour
+   and ghp_global.industry is null
+),
+scored_with_bandit as (
+  select
+    s.platform,
+    s.timeslot,
+    s.dow,
+    s.hour,
+    s.segment_id,
+    s.predicted_avg,
+    coalesce(bp.bandit_alpha, 1.0) as bandit_alpha,
+    coalesce(bp.bandit_beta,  1.0) as bandit_beta
+  from scored s
+  left join public.v_bandit_params bp
+    on bp.platform = s.platform
+   and bp.dow      = s.dow
+   and bp.hour     = s.hour
+)
+select
+  platform,
+  timeslot,
+  dow,
+  hour,
+  segment_id,
+  predicted_avg,
+  bandit_alpha,
+  bandit_beta
+from scored_with_bandit
+where platform = coalesce(p_platform, platform)
+order by timeslot
+limit 200;
 $$;
+
+
 
 create table if not exists public.scheduled_posts_target_segments (
   id bigserial primary key,
@@ -2457,37 +2558,62 @@ group by
 
 
 create or replace function public.generate_7day_smart_plan(
-  p_platform platform_enum,
+  p_platform text,
   p_n_slots  int default 7
 )
-returns jsonb
+returns table (
+  slot_index    int,
+  platform      platform_enum,
+  timeslot      timestamptz,
+  score         numeric,
+  predicted_avg numeric
+)
 language sql
 security definer
 set search_path = public
 as $$
-with ranked as (
+with bandit_inputs as (
   select
-    timeslot,
-    dow,
-    hour,
-    predicted_avg,
-    row_number() over (order by timeslot) as idx
-  from public.get_time_segment_recommendations(p_platform, 7)
-  limit p_n_slots
+    g.platform,
+    g.timeslot,
+    g.dow,
+    g.hour,
+    g.segment_id,
+    g.predicted_avg,
+    g.bandit_alpha,
+    g.bandit_beta
+  from public.get_time_segment_bandit_inputs(
+    p_platform     => p_platform::platform_enum,
+    p_horizon_days => 7
+  ) g
 ),
-with_objects as (
+scored as (
   select
-    idx,
-    jsonb_build_object(
-      'slot_index', idx,
-      'platform',   p_platform,
-      'timeslot',   timeslot,
-      'dow',        dow,
-      'hour',       hour,
-      'score',      predicted_avg
-    ) as obj
-  from ranked
+    platform,
+    timeslot,
+    predicted_avg,
+    case
+      when bandit_alpha is null or bandit_beta is null then predicted_avg
+      else bandit_alpha / nullif(bandit_alpha + bandit_beta, 0)
+    end as ts_sample
+  from bandit_inputs
+),
+ranked as (
+  select
+    row_number() over (order by ts_sample desc) as slot_index,
+    platform,
+    timeslot,
+    ts_sample   as score,
+    predicted_avg
+  from scored
 )
-select coalesce(jsonb_agg(obj order by idx), '[]'::jsonb)
-from with_objects;
+select
+  slot_index,
+  platform,
+  timeslot,
+  score,
+  predicted_avg
+from ranked
+order by slot_index
+limit p_n_slots;
 $$;

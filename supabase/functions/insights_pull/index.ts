@@ -1,5 +1,5 @@
-
 // supabase/functions/insights_pull/index.ts
+
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.48.0";
 
@@ -26,18 +26,17 @@ serve(async () => {
     return new Response("ERROR loading posts", { status: 500 });
   }
 
-  // Track all users/platforms we successfully processed so we can
-  // rebuild their time-slot features after this run.
   const touchedUserPlatforms = new Set<string>();
 
   for (const p of posts ?? []) {
     try {
-      // Get the right token for this user+platform
+      // Get the token for this user+platform (only active page)
       const { data: acct, error: eAcct } = await sb
         .from("connected_meta_accounts")
-        .select("access_token,page_id,ig_user_id")
+        .select("access_token,page_id,ig_user_id,is_active")
         .eq("user_id", p.user_id)
         .eq("platform", "facebook")
+        .eq("is_active", true)
         .single();
 
       if (eAcct || !acct?.access_token || !p.api_post_id) {
@@ -115,14 +114,12 @@ serve(async () => {
 
       if (fieldsJson.error) {
         console.error("FB fields error", fieldsJson.error);
-        // If this fails, we just won't have comments/shares for this post
       }
 
       let shares = 0;
       let comments = 0;
 
       if (!fieldsJson.error) {
-        // shares.count
         if (fieldsJson.shares && typeof fieldsJson.shares.count === "number") {
           shares = fieldsJson.shares.count;
           await sb.from("analytics_events").insert({
@@ -135,7 +132,6 @@ serve(async () => {
           });
         }
 
-        // comments.summary.total_count
         if (
           fieldsJson.comments &&
           fieldsJson.comments.summary &&
@@ -155,7 +151,6 @@ serve(async () => {
 
       /* -------------------------------------------------
        * 3) DERIVED METRIC: engagement
-       *    engagement = likes + comments + shares
        * ------------------------------------------------- */
       const engagement = likes + comments + shares;
       await sb.from("analytics_events").insert({
@@ -167,19 +162,13 @@ serve(async () => {
         ts,
       });
 
-      // Mark that we have fresh analytics for this user+platform
       touchedUserPlatforms.add(`${p.user_id}|facebook`);
     } catch (err) {
       console.error("insights_pull: per-post error", err);
     }
   }
 
-  // -------------------------------------------------
-  // 4) Build time-slot features for all touched users
-  //    This populates features_engagement_timeslots and
-  //    refreshes mv_user_hourly_perf, which are required
-  //    by get_time_segment_recommendations().
-  // -------------------------------------------------
+  // Build time-slot features for all touched users
   for (const key of touchedUserPlatforms) {
     const [userId, platform] = key.split("|") as [string, "facebook"];
     try {
@@ -187,8 +176,7 @@ serve(async () => {
         "build_timeslot_features",
         {
           p_user_id: userId,
-          p_platform: platform, // 'facebook'
-          // p_history_days and p_future_days use defaults (90, 14)
+          p_platform: platform,
         },
       );
 
@@ -205,8 +193,8 @@ serve(async () => {
       }
     } catch (err) {
       console.error(
-        "insights_pull: exception calling build_timeslot_features",
-        { userId, platform, err },
+          "insights_pull: exception calling build_timeslot_features",
+          { userId, platform, err },
       );
     }
   }

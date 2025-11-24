@@ -1,5 +1,12 @@
 // lib/bandit.ts
 
+// This bandit logic is used to model our *engagement score* posterior.
+// The "success probability" we sample from Beta(α, β) is NOT a binary CTR,
+// but a normalized engagement score derived from:
+//   reward ≈ likes + comments + shares
+// (and anything else you add). Impressions are now synthetic,
+// just so your pipeline never sees empty values.
+
 // Simple Gamma sampler (Marsaglia & Tsang) – good enough for Thompson Sampling.
 function sampleGamma(shape: number, scale = 1): number {
   if (shape <= 0) {

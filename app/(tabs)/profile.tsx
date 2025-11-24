@@ -28,10 +28,10 @@ type ConnectedMeta = {
   platform: DBPlatform;
   page_id: string | null;
   page_name: string | null;
-  ig_user_id: string | null;
-  ig_username?: string | null;
   access_token: string;
   token_expires_at: string | null;
+  user_token_expires_at?: string | null;
+  is_active?: boolean | null;
 };
 
 type Industry =
@@ -195,6 +195,8 @@ const INDUSTRY_OPTIONS: IndustryOption[] = [
 type BrandProfileRow = {
   brand_name: string | null;
   industry: Industry | null;
+  platform?: DBPlatform;
+  page_id?: string | null;
 };
 
 const OAUTH_BASE =
@@ -223,7 +225,7 @@ function useConnections() {
       const { data, error } = await supabase
         .from("connected_meta_accounts")
         .select(
-          "id, platform, page_id, page_name, ig_user_id, ig_username, access_token, token_expires_at"
+          "id, platform, page_id, page_name, access_token, token_expires_at, user_token_expires_at, is_active"
         )
         .eq("platform", "facebook")
         .order("created_at", { ascending: false });
@@ -264,7 +266,7 @@ export default function ProfileScreen() {
   const [email, setEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
-  // Brand profile state
+  // Brand profile state (now page-specific)
   const [brandName, setBrandName] = useState("");
   const [industry, setIndustry] = useState<Industry>("other");
   const [brandLoading, setBrandLoading] = useState(false);
@@ -275,18 +277,24 @@ export default function ProfileScreen() {
   const [industryPickerVisible, setIndustryPickerVisible] = useState(false);
   const [industrySearch, setIndustrySearch] = useState("");
 
+  // Page picker state
+  const [pagePickerVisible, setPagePickerVisible] = useState(false);
+
   const headerHeight = useHeaderHeight();
   const insets = useSafeAreaInsets();
 
   const loadBrandProfile = useCallback(
-    async (uid: string) => {
+    async (uid: string, platform: DBPlatform, pageId: string) => {
       try {
         setBrandLoading(true);
         const { data, error } = await supabase
           .from("brand_profiles")
           .select("brand_name, industry")
           .eq("user_id", uid)
+          .eq("platform", platform)
+          .eq("page_id", pageId)
           .maybeSingle<BrandProfileRow>();
+
         if (error && error.code !== "PGRST116") {
           throw error;
         }
@@ -307,6 +315,7 @@ export default function ProfileScreen() {
     []
   );
 
+  // Load user basics
   useEffect(() => {
     (async () => {
       const { data } = await supabase.auth.getUser();
@@ -319,10 +328,9 @@ export default function ProfileScreen() {
       setEmail(user?.email ?? null);
       if (user?.id) {
         setUserId(user.id);
-        await loadBrandProfile(user.id);
       }
     })();
-  }, [loadBrandProfile]);
+  }, []);
 
   const industryLabel = useMemo(
     () =>
@@ -331,25 +339,57 @@ export default function ProfileScreen() {
     [industry]
   );
 
+  const connected = rows.length > 0;
+
+  const activeConnection = useMemo<ConnectedMeta | null>(() => {
+    if (!rows.length) return null;
+    const active = rows.find((r) => r.is_active);
+    return active ?? rows[0];
+  }, [rows]);
+
+  const hasPageContext = !!(activeConnection && activeConnection.page_id);
+
+  // Re-load brand profile whenever user or active page changes
+  useEffect(() => {
+    (async () => {
+      if (!userId || !hasPageContext || !activeConnection?.page_id) {
+        // Reset to blank when there is no active page
+        setBrandName("");
+        setIndustry("other");
+        return;
+      }
+      await loadBrandProfile(userId, activeConnection.platform, activeConnection.page_id);
+    })();
+  }, [userId, hasPageContext, activeConnection, loadBrandProfile]);
+
   const saveBrandProfile = useCallback(async () => {
     if (!userId) {
       Alert.alert("Sign in required", "Please sign in first.");
+      return;
+    }
+    if (!activeConnection?.page_id) {
+      Alert.alert(
+        "Connect a Page",
+        "Link a Facebook Page first so we can save a brand profile for it."
+      );
       return;
     }
     try {
       setBrandSaving(true);
       const payload = {
         user_id: userId,
+        platform: activeConnection.platform,
+        page_id: activeConnection.page_id,
         brand_name: brandName.trim() || null,
         industry,
       };
 
       const { error } = await supabase
         .from("brand_profiles")
-        .upsert(payload, { onConflict: "user_id" });
+        .upsert(payload, { onConflict: "user_id,platform,page_id" });
       if (error) throw error;
 
-      Alert.alert("Saved", "Brand profile updated.");
+      Alert.alert("Saved", "Brand profile updated for this page.");
       setIsEditingBrand(false);
     } catch (e: any) {
       console.error("Save brand profile failed:", e?.message || e);
@@ -357,7 +397,7 @@ export default function ProfileScreen() {
     } finally {
       setBrandSaving(false);
     }
-  }, [userId, brandName, industry]);
+  }, [userId, brandName, industry, activeConnection]);
 
   const userTag = displayName || email || "User";
   const avatarText = useMemo(
@@ -425,35 +465,55 @@ export default function ProfileScreen() {
     }
   };
 
-  // Change Page: remove current connection, then re-run connectMeta
-  const connected = rows.length > 0;
-  const primary = rows[0] || null;
+  const setActivePage = useCallback(
+    async (row: ConnectedMeta) => {
+      if (!userId || !row.page_id) return;
+      try {
+        setWorking(row.id);
+        const resp = await fetch(`${OAUTH_BASE}/meta_set_active_page`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: userId, page_id: row.page_id }),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          console.error("meta_set_active_page error", txt);
+          Alert.alert("Error", "Could not set active page.");
+        } else {
+          await refresh();
+        }
+      } catch (e: any) {
+        console.error("setActivePage failed", e?.message || e);
+        Alert.alert("Error", e?.message ?? "Could not set active page.");
+      } finally {
+        setWorking(null);
+        setPagePickerVisible(false);
+      }
+    },
+    [userId, refresh]
+  );
 
-  const changePage = useCallback(async () => {
-    if (!primary) {
-      // If nothing connected, just run connect flow
-      await connectMeta();
-      return;
+  const tokenWarning = useMemo(() => {
+    if (!activeConnection) return null;
+    const raw =
+      activeConnection.user_token_expires_at ?? activeConnection.token_expires_at;
+    if (!raw) return null;
+    const expMs = new Date(raw).getTime();
+    if (Number.isNaN(expMs)) return null;
+    const now = Date.now();
+    const diffDays = (expMs - now) / (1000 * 60 * 60 * 24);
+
+    if (diffDays <= 0) {
+      return { status: "expired" as const };
     }
-
-    try {
-      setWorking(primary.id);
-      const { error } = await supabase
-        .from("connected_meta_accounts")
-        .delete()
-        .eq("id", primary.id);
-      if (error) throw error;
-
-      await refresh();
-      setWorking(null);
-
-      // Start fresh connection so user can pick a different page
-      await connectMeta();
-    } catch (e: any) {
-      setWorking(null);
-      Alert.alert("Change Page failed", e?.message ?? "Unexpected error.");
+    if (diffDays <= 7) {
+      return {
+        status: "expiring" as const,
+        days: Math.max(1, Math.round(diffDays)),
+      };
     }
-  }, [primary, refresh]);
+    return null;
+  }, [activeConnection]);
 
   const onSignOut = async () => {
     try {
@@ -485,7 +545,6 @@ export default function ProfileScreen() {
       if (!groups[opt.category]) groups[opt.category] = [];
       groups[opt.category].push(opt);
     });
-    // simple sort by category name so it's stable
     return Object.keys(groups)
       .sort()
       .map((key) => ({ category: key, items: groups[key] }));
@@ -495,6 +554,8 @@ export default function ProfileScreen() {
     setIndustryPickerVisible(false);
     setIndustrySearch("");
   };
+
+  const avatarStatusSubtitle = email ? email : undefined;
 
   return (
     <>
@@ -507,12 +568,18 @@ export default function ProfileScreen() {
             paddingBottom: insets.bottom + 24,
           },
         ]}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
       >
         {/* ---------- HEADER ---------- */}
         <View style={styles.hero}>
           <View style={styles.heroTopRow}>
-            <TouchableOpacity onPress={onSignOut} style={styles.signOutBtn} activeOpacity={0.85}>
+            <TouchableOpacity
+              onPress={onSignOut}
+              style={styles.signOutBtn}
+              activeOpacity={0.85}
+            >
               <Text style={styles.signOutText}>Sign out</Text>
             </TouchableOpacity>
           </View>
@@ -525,9 +592,9 @@ export default function ProfileScreen() {
               <Text style={styles.userName} numberOfLines={1}>
                 {userTag}
               </Text>
-              {email ? (
+              {avatarStatusSubtitle ? (
                 <Text style={styles.userEmail} numberOfLines={1}>
-                  {email}
+                  {avatarStatusSubtitle}
                 </Text>
               ) : null}
               <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
@@ -547,17 +614,35 @@ export default function ProfileScreen() {
 
         {/* ---------- BODY ---------- */}
         <View style={styles.body}>
-          {/* Brand Profile Card */}
+          {/* Brand Profile Card (now per page) */}
           <View style={styles.profilecard}>
             <View style={styles.cardHeaderRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.cardTitle}>Brand Profile</Text>
+                <Text style={styles.cardSubtle}>
+                  {hasPageContext
+                    ? `For page: ${
+                        activeConnection?.page_name ||
+                        activeConnection?.page_id ||
+                        "Unnamed Page"
+                      }`
+                    : "Connect a Facebook Page to set up a brand profile for it."}
+                </Text>
               </View>
               <TouchableOpacity
-                onPress={() => setIsEditingBrand((v) => !v)}
+                onPress={() => {
+                  if (!hasPageContext) {
+                    Alert.alert(
+                      "Connect a Page",
+                      "Link a Facebook Page first so we know which page this brand profile belongs to."
+                    );
+                    return;
+                  }
+                  setIsEditingBrand((v) => !v);
+                }}
                 style={styles.editPill}
                 activeOpacity={0.9}
-                disabled={brandLoading || brandSaving || !userId}
+                disabled={brandLoading || brandSaving || !userId || !hasPageContext}
               >
                 <Text style={styles.editPillText}>
                   {isEditingBrand ? "Done" : brandName || industry ? "Edit" : "Set up"}
@@ -574,7 +659,7 @@ export default function ProfileScreen() {
               </View>
             ) : (
               <>
-                {/* Minimal summary view (always visible) */}
+                {/* Minimal summary view */}
                 <View style={styles.summaryRow}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.summaryLabel}>Brand name</Text>
@@ -591,25 +676,29 @@ export default function ProfileScreen() {
                   </View>
                 </View>
 
-                {/* Editable controls only when editing */}
+                {/* Editable controls */}
                 {isEditingBrand && (
                   <>
-                    <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Brand name</Text>
+                    <Text style={[styles.fieldLabel, { marginTop: 18 }]}>
+                      Brand name
+                    </Text>
                     <TextInput
                       value={brandName}
                       onChangeText={setBrandName}
                       placeholder="e.g. Salus Skin & Wellness Clinic"
                       placeholderTextColor="#9CA3AF"
                       style={styles.textInput}
-                      editable={!brandLoading && !brandSaving}
+                      editable={!brandLoading && !brandSaving && hasPageContext}
                     />
 
-                    <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Industry</Text>
+                    <Text style={[styles.fieldLabel, { marginTop: 14 }]}>
+                      Industry
+                    </Text>
                     <TouchableOpacity
                       style={styles.selectField}
                       onPress={() => setIndustryPickerVisible(true)}
                       activeOpacity={0.9}
-                      disabled={brandSaving}
+                      disabled={brandSaving || !hasPageContext}
                     >
                       <Text
                         style={
@@ -622,7 +711,7 @@ export default function ProfileScreen() {
                         {industryLabel}
                       </Text>
                       <FontAwesome
-                        name="chevron-right"
+                        name="chevron-down"
                         size={14}
                         color="#9CA3AF"
                         style={{ marginLeft: 8 }}
@@ -633,11 +722,14 @@ export default function ProfileScreen() {
                       onPress={saveBrandProfile}
                       style={[
                         styles.primaryBtn,
-                        (brandSaving || brandLoading || !userId) && styles.btnDisabled,
+                        (brandSaving || brandLoading || !userId || !hasPageContext) &&
+                          styles.btnDisabled,
                         { marginTop: 16 },
                       ]}
                       activeOpacity={0.92}
-                      disabled={brandSaving || brandLoading || !userId}
+                      disabled={
+                        brandSaving || brandLoading || !userId || !hasPageContext
+                      }
                     >
                       {brandSaving ? (
                         <View style={styles.rowCenter}>
@@ -649,7 +741,9 @@ export default function ProfileScreen() {
                           </Text>
                         </View>
                       ) : (
-                        <Text style={styles.primaryBtnText}>Save Brand Profile</Text>
+                        <Text style={styles.primaryBtnText}>
+                          Save Brand Profile
+                        </Text>
                       )}
                     </TouchableOpacity>
                   </>
@@ -687,73 +781,188 @@ export default function ProfileScreen() {
             </View>
           ) : (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Linked Accounts</Text>
+              <Text style={styles.cardTitle}>Linked Facebook Page</Text>
+              <Text style={styles.cardSubtle}>
+                PRISM uses your active page for posting and analytics.
+              </Text>
 
-              <View style={styles.itemRow}>
-                <View style={styles.itemIconWrap}>
-                  <FontAwesome name="facebook-square" size={20} color="#1877F2" />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.itemLabel}>Facebook Page</Text>
-                  <Text style={styles.itemValue}>
-                    {primary?.page_name || primary?.page_id || "—"}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.inlineRow}>
-                <TouchableOpacity
-                  onPress={changePage}
-                  style={[
-                    styles.secondaryBtn,
-                    (connecting || working) && styles.btnDisabled,
-                  ]}
-                  activeOpacity={0.92}
-                  disabled={!!(connecting || working)}
-                >
-                  {connecting ? (
-                    <View style={styles.rowCenter}>
-                      <ActivityIndicator />
-                      <Text
-                        style={[styles.secondaryBtnText, { marginLeft: 8 }]}
-                      >
-                        Opening…
+              {activeConnection && (
+                <>
+                  <TouchableOpacity
+                    style={styles.activePageField}
+                    activeOpacity={0.9}
+                    onPress={() => setPagePickerVisible(true)}
+                  >
+                    <View style={styles.itemIconWrap}>
+                      <FontAwesome name="facebook-square" size={20} color="#1877F2" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.itemLabel}>Active Page</Text>
+                      <Text style={styles.itemValue} numberOfLines={1}>
+                        {activeConnection.page_name ||
+                          activeConnection.page_id ||
+                          "—"}
                       </Text>
                     </View>
-                  ) : (
-                    <Text style={styles.secondaryBtnText}>Change Page</Text>
-                  )}
-                </TouchableOpacity>
+                    <View className="activeBadge">
+                      <View style={styles.activeBadge}>
+                        <Text style={styles.activeBadgeText}>Active</Text>
+                      </View>
+                    </View>
+                    <FontAwesome
+                      name="chevron-down"
+                      size={14}
+                      color="#9CA3AF"
+                      style={{ marginLeft: 6 }}
+                    />
+                  </TouchableOpacity>
 
-                <TouchableOpacity
-                  onPress={() => disconnect(primary!)}
-                  style={[
-                    styles.ghostDanger,
-                    (working === primary?.id || connecting) && styles.btnDisabled,
-                  ]}
-                  activeOpacity={0.92}
-                  disabled={working === primary?.id || connecting}
-                >
-                  {working === primary?.id ? (
-                    <View style={styles.rowCenter}>
-                      <ActivityIndicator />
-                      <Text
-                        style={[styles.ghostDangerText, { marginLeft: 8 }]}
+                  {tokenWarning && (
+                    <View style={styles.warningBanner}>
+                      <View style={styles.warningIconWrap}>
+                        <FontAwesome
+                          name="exclamation-triangle"
+                          size={14}
+                          color="#B45309"
+                        />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.warningTitle}>
+                          {tokenWarning.status === "expired"
+                            ? "Connection expired"
+                            : "Connection expiring soon"}
+                        </Text>
+                        <Text style={styles.warningText}>
+                          {tokenWarning.status === "expired"
+                            ? "Your Meta connection has expired. Please reconnect to keep insights and scheduling working."
+                            : `Your Meta connection will expire in about ${tokenWarning.days} day(s). Reconnect to avoid interruptions.`}
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        onPress={connectMeta}
+                        style={styles.warningButton}
+                        activeOpacity={0.9}
                       >
-                        Removing…
+                        <Text style={styles.warningButtonText}>Reconnect</Text>
+                      </TouchableOpacity>
+                    </View>
+                  )}
+
+                  <View style={styles.inlineRow}>
+                    <TouchableOpacity
+                      onPress={() => setPagePickerVisible(true)}
+                      style={[
+                        styles.secondaryBtn,
+                        (connecting || working) && styles.btnDisabled,
+                      ]}
+                      activeOpacity={0.92}
+                      disabled={!!(connecting || working)}
+                    >
+                      <Text style={styles.secondaryBtnText}>
+                        Change Active Page
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      onPress={() => disconnect(activeConnection)}
+                      style={[
+                        styles.ghostDanger,
+                        (working === activeConnection.id || connecting) &&
+                          styles.btnDisabled,
+                      ]}
+                      activeOpacity={0.92}
+                      disabled={working === activeConnection.id || connecting}
+                    >
+                      {working === activeConnection.id ? (
+                        <View style={styles.rowCenter}>
+                          <ActivityIndicator />
+                          <Text
+                            style={[styles.ghostDangerText, { marginLeft: 8 }]}
+                          >
+                            Removing…
+                          </Text>
+                        </View>
+                      ) : (
+                        <Text style={styles.ghostDangerText}>Disconnect</Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                </>
+              )}
+            </View>
+          )}
+
+          {/* All Pages List (for clarity) */}
+          {connected && rows.length > 1 && (
+            <View style={[styles.card, { marginTop: 16 }]}>
+              <Text style={styles.cardTitle}>Your Connected Pages</Text>
+              <Text style={styles.cardSubtle}>
+                Tap a page below to make it active.
+              </Text>
+
+              {rows.map((row) => {
+                const active = !!row.is_active;
+                return (
+                  <TouchableOpacity
+                    key={row.id}
+                    style={[
+                      styles.itemRow,
+                      { borderTopWidth: 1, borderTopColor: BORDER },
+                      active && { backgroundColor: "#ECFDF5" },
+                    ]}
+                    activeOpacity={0.85}
+                    onPress={() => setActivePage(row)}
+                  >
+                    <View style={styles.itemIconWrap}>
+                      <FontAwesome name="facebook-square" size={20} color="#1877F2" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.itemLabel}>
+                        {active ? "Active" : "Connected"}
+                      </Text>
+                      <Text style={styles.itemValue} numberOfLines={1}>
+                        {row.page_name || row.page_id || "—"}
                       </Text>
                     </View>
-                  ) : (
-                    <Text style={styles.ghostDangerText}>Disconnect</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
+                    {active && (
+                      <FontAwesome name="check-circle" size={18} color="#16A34A" />
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+
+          {/* Connect CTA if already connected but want another page */}
+          {connected && (
+            <View style={[styles.card, { marginTop: 16 }]}>
+              <Text style={styles.cardTitle}>Add another Page</Text>
+              <Text style={styles.cardSubtle}>
+                You can connect multiple Facebook Pages and switch which one is active.
+              </Text>
+              <TouchableOpacity
+                onPress={connectMeta}
+                style={[styles.primaryBtn, connecting && styles.btnDisabled]}
+                activeOpacity={0.92}
+                disabled={connecting}
+              >
+                {connecting ? (
+                  <View style={styles.rowCenter}>
+                    <ActivityIndicator />
+                    <Text style={[styles.primaryBtnText, { marginLeft: 8 }]}>
+                      Opening…
+                    </Text>
+                  </View>
+                ) : (
+                  <Text style={styles.primaryBtnText}>Connect Another Page</Text>
+                )}
+              </TouchableOpacity>
             </View>
           )}
         </View>
       </ScrollView>
 
-      {/* ---------- INDUSTRY PICKER MODAL (fullscreen-ish) ---------- */}
+      {/* ---------- INDUSTRY PICKER MODAL ---------- */}
       <Modal
         visible={industryPickerVisible}
         animationType="slide"
@@ -775,7 +984,7 @@ export default function ProfileScreen() {
               <Text style={styles.modalCloseText}>Cancel</Text>
             </TouchableOpacity>
             <Text style={styles.modalTitle}>Choose your industry</Text>
-            <View style={{ width: 60 }} />{/* spacer */}
+            <View style={{ width: 60 }} />
           </View>
 
           <View style={styles.searchWrapper}>
@@ -845,6 +1054,80 @@ export default function ProfileScreen() {
                   })}
                 </View>
               ))
+            )}
+          </ScrollView>
+        </View>
+      </Modal>
+
+      {/* ---------- PAGE PICKER MODAL ---------- */}
+      <Modal
+        visible={pagePickerVisible}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setPagePickerVisible(false)}
+      >
+        <View
+          style={[
+            styles.modalContainer,
+            { paddingTop: insets.top + 12 },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <TouchableOpacity
+              onPress={() => setPagePickerVisible(false)}
+              style={styles.modalClose}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.modalCloseText}>Cancel</Text>
+            </TouchableOpacity>
+          <Text style={styles.modalTitle}>Select active page</Text>
+            <View style={{ width: 60 }} />
+          </View>
+
+          <ScrollView
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24 }}
+          >
+            {rows.length === 0 ? (
+              <View style={styles.noResults}>
+                <Text style={styles.noResultsText}>
+                  No pages connected yet.
+                </Text>
+              </View>
+            ) : (
+              rows.map((row) => {
+                const active = !!row.is_active;
+                return (
+                  <TouchableOpacity
+                    key={row.id}
+                    style={[
+                      styles.industryOptionRow,
+                      active && styles.industryOptionSelected,
+                    ]}
+                    activeOpacity={0.85}
+                    onPress={() => setActivePage(row)}
+                  >
+                    <View style={styles.itemIconWrap}>
+                      <FontAwesome
+                        name="facebook-square"
+                        size={20}
+                        color="#1877F2"
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.industryOptionLabel}>
+                        {row.page_name || row.page_id || "—"}
+                      </Text>
+                      <Text style={styles.industryOptionSlug}>
+                        {active ? "Active page" : "Tap to make active"}
+                      </Text>
+                    </View>
+                    {active && (
+                      <FontAwesome name="check-circle" size={18} color="#16A34A" />
+                    )}
+                  </TouchableOpacity>
+                );
+              })
             )}
           </ScrollView>
         </View>
@@ -952,13 +1235,11 @@ const styles = StyleSheet.create({
     color: "#111827",
   },
   itemRow: {
-    marginTop: 14,
+    marginTop: 8,
     paddingVertical: 8,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    borderTopWidth: 1,
-    borderTopColor: BORDER,
   },
   itemIconWrap: {
     width: 34,
@@ -1022,7 +1303,6 @@ const styles = StyleSheet.create({
     color: TEXT_DARK,
     backgroundColor: "#F9FAFB",
   },
-
   summaryRow: {
     marginTop: 14,
     paddingVertical: 4,
@@ -1038,6 +1318,75 @@ const styles = StyleSheet.create({
     color: TEXT_DARK,
     fontWeight: "700",
     marginTop: 2,
+  },
+
+  // Active page capsule
+  activePageField: {
+    marginTop: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F9FAFB",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  activeBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: "#DCFCE7",
+    borderRadius: 999,
+  },
+  activeBadgeText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#166534",
+    textTransform: "uppercase",
+  },
+
+  // Warning banner
+  warningBanner: {
+    marginTop: 12,
+    padding: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#FBBF24",
+    backgroundColor: "#FFFBEB",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  warningIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#FEF3C7",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  warningTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#92400E",
+  },
+  warningText: {
+    fontSize: 12,
+    color: "#92400E",
+    marginTop: 2,
+  },
+  warningButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#D97706",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  warningButtonText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#92400E",
   },
 
   // Industry select
@@ -1128,6 +1477,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 6,
+    gap: 10,
   },
   industryOptionSelected: {
     borderColor: "#111827",

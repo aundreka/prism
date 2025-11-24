@@ -9,7 +9,7 @@ const FB_GRAPH = "https://graph.facebook.com/v21.0";
 type Sched = {
   id: string;
   user_id: string;
-  platform: "facebook" | "instagram";
+  platform: "facebook"; // we only support facebook here
   target_id: string;
   post_id: string | null;
   caption: string | null;
@@ -21,6 +21,7 @@ type Sched = {
   permalink: string | null;
   error_message: string | null;
   attempts?: number | null;
+  page_id: string | null;
 };
 
 type Conn = {
@@ -31,7 +32,12 @@ type Conn = {
   page_name: string | null;
   ig_user_id: string | null;
   ig_username: string | null;
-  access_token: string; // PAGE token
+  access_token: string;
+  token_expires_at: string | null;
+  user_access_token: string | null;
+  user_token_expires_at: string | null;
+  is_active: boolean | null;
+  scopes: string[] | null;
 };
 
 type Media = {
@@ -64,14 +70,13 @@ type ParsedFB = {
   raw: string;
 };
 
-// Parse any FB response (even non-JSON)
 async function parseFB(r: Response): Promise<ParsedFB> {
   const text = await r.text();
   let json: any = null;
   try {
     json = JSON.parse(text);
   } catch {
-    // ignore JSON parse failures
+    // ignore parse failures
   }
   return { ok: r.ok, json, raw: text };
 }
@@ -80,7 +85,6 @@ Deno.serve(async (_req: Request) => {
   const sb = createClient(SUPABASE_URL, SERVICE_ROLE);
 
   try {
-    // 1) Pull due jobs (scheduled_at <= now)
     const nowIso = new Date().toISOString();
     const { data: due, error: dueErr } = await sb
       .from("scheduled_posts")
@@ -104,7 +108,23 @@ Deno.serve(async (_req: Request) => {
     }
 
     for (const job of due as Sched[]) {
-      // mark as posting (avoid double-run)
+      // safety: only facebook is supported
+      if (job.platform !== "facebook") {
+        console.warn("Unsupported platform for job, marking failed:", job.id, job.platform);
+        try {
+          await sb
+            .from("scheduled_posts")
+            .update({
+              status: "failed",
+              error_message: "platform_not_supported",
+            })
+            .eq("id", job.id);
+        } catch (markErr) {
+          console.error("failed to mark unsupported job failed:", job.id, markErr);
+        }
+        continue;
+      }
+
       const { error: upErr } = await sb
         .from("scheduled_posts")
         .update({ status: "posting" })
@@ -112,7 +132,6 @@ Deno.serve(async (_req: Request) => {
 
       if (upErr) {
         console.error("failed to mark posting:", job.id, upErr);
-        // store the failure (best-effort)
         try {
           await sb.rpc("sp_attempt_fail", {
             p_id: job.id,
@@ -125,7 +144,7 @@ Deno.serve(async (_req: Request) => {
       }
 
       try {
-        // 2) find connection row with page token matching target
+        // 🔑 IMPORTANT: allow *any* connected page, not just is_active
         const { data: conns, error: cErr } = await sb
           .from("connected_meta_accounts")
           .select("*")
@@ -137,18 +156,16 @@ Deno.serve(async (_req: Request) => {
         }
 
         const connections = (conns || []) as Conn[];
-        const conn =
-          job.platform === "facebook"
-            ? connections.find(
-                (c) => c.page_id && c.page_id === job.target_id,
-              )
-            : connections.find(
-                (c) => c.ig_user_id && c.ig_user_id === job.target_id,
-              );
+
+        const conn = connections.find(
+          (c) => c.page_id && c.page_id === job.target_id,
+        );
 
         if (!conn || !conn.access_token) {
-          throw new Error("access_token_not_found");
+          throw new Error("access_token_not_found_for_target_page");
         }
+
+        const pageIdForJob = conn.page_id ?? job.target_id;
 
         // 3) gather media (ordered)
         const { data: spm, error: spmErr } = await sb
@@ -174,85 +191,45 @@ Deno.serve(async (_req: Request) => {
           media = (assets || []) as Media[];
         }
 
-        // 4) publish
         const caption = job.caption || "";
-        if (job.platform === "facebook") {
-          const { apiId, permalink } = await publishToFacebook({
-            pageId: conn.page_id as string,
-            pageToken: conn.access_token,
-            caption,
-            media,
-          });
 
-          const { error: updateErr } = await sb
-            .from("scheduled_posts")
-            .update({
-              status: "posted",
-              posted_at: new Date().toISOString(),
-              api_post_id: apiId || null,
-              permalink: permalink || null,
-              error_message: null,
-            })
-            .eq("id", job.id);
+        const { apiId, permalink } = await publishToFacebook({
+          pageId: pageIdForJob,
+          pageToken: conn.access_token,
+          caption,
+          media,
+        });
 
-          // ⬅️ important: don't silently fail this
-          if (updateErr) {
-            throw new Error(
-              `mark_posted_failed:${(updateErr as any).message || updateErr}`,
-            );
-          }
+        const { error: updateErr } = await sb
+          .from("scheduled_posts")
+          .update({
+            status: "posted",
+            posted_at: new Date().toISOString(),
+            api_post_id: apiId || null,
+            permalink: permalink || null,
+            error_message: null,
+            page_id: pageIdForJob,
+          })
+          .eq("id", job.id);
 
-          // 🔵 NEW: record bandit reward for this post (best-effort)
-          try {
-            await sb.rpc("record_bandit_reward_for_post", {
-              p_scheduled_post_id: job.id,
-            });
-          } catch (rbErr) {
-            console.error(
-              "record_bandit_reward_for_post failed (facebook):",
-              job.id,
-              rbErr,
-            );
-          }
-        } else {
-          const { apiId } = await publishToInstagram({
-            igUserId: conn.ig_user_id as string,
-            pageToken: conn.access_token,
-            caption,
-            media,
-          });
-
-          const { error: updateErr } = await sb
-            .from("scheduled_posts")
-            .update({
-              status: "posted",
-              posted_at: new Date().toISOString(),
-              api_post_id: apiId || null,
-              error_message: null,
-            })
-            .eq("id", job.id);
-
-          if (updateErr) {
-            throw new Error(
-              `ig_mark_posted_failed:${(updateErr as any).message || updateErr}`,
-            );
-          }
-
-          // 🔵 NEW: record bandit reward for this post (best-effort)
-          try {
-            await sb.rpc("record_bandit_reward_for_post", {
-              p_scheduled_post_id: job.id,
-            });
-          } catch (rbErr) {
-            console.error(
-              "record_bandit_reward_for_post failed (instagram):",
-              job.id,
-              rbErr,
-            );
-          }
+        if (updateErr) {
+          throw new Error(
+            `mark_posted_failed:${(updateErr as any).message || updateErr}`,
+          );
         }
 
-        // 5) push notify
+        try {
+          await sb.rpc("record_bandit_reward_for_post", {
+            p_scheduled_post_id: job.id,
+          });
+        } catch (rbErr) {
+          console.error(
+            "record_bandit_reward_for_post failed:",
+            job.id,
+            rbErr,
+          );
+        }
+
         const { data: devices } = await sb
           .from("user_devices")
           .select("expo_push_token")
@@ -264,9 +241,7 @@ Deno.serve(async (_req: Request) => {
             await sendExpoPush(
               (d as any).expo_push_token,
               "Post published ✅",
-              job.platform === "facebook"
-                ? "Your Facebook post has been published."
-                : "Your Instagram post has been published.",
+              "Your Facebook post has been published.",
             );
           } catch {
             // ignore push errors
@@ -279,7 +254,6 @@ Deno.serve(async (_req: Request) => {
             : String(e);
         console.error("job failed:", job.id, msg);
 
-        // 🔴 NEW: mark job as failed so it doesn't stay stuck in "posting"
         try {
           await sb
             .from("scheduled_posts")
@@ -292,7 +266,6 @@ Deno.serve(async (_req: Request) => {
           console.error("failed to mark job failed:", job.id, markErr);
         }
 
-        // keep your existing attempts log
         try {
           await sb.rpc("sp_attempt_fail", {
             p_id: job.id,
@@ -300,6 +273,7 @@ Deno.serve(async (_req: Request) => {
           });
         } catch {
           // ignore
+          // sp_attempt_fail already exists in your schema
         }
       }
     }
@@ -340,7 +314,7 @@ async function publishToFacebook({
     (m) => (m.mime_type || "").startsWith("video/") && m.public_url,
   );
 
-  // Multi-image carousel (photos → unpublished children → /feed)
+  // Multi-image carousel
   if (imgs.length > 1 && vids.length === 0) {
     const childIds: string[] = [];
     for (const img of imgs) {
@@ -452,59 +426,4 @@ async function publishToFacebook({
   }
 
   return { apiId: json.id as string | undefined, permalink };
-}
-
-/** ------------------ IG helpers ------------------ */
-type PublishArgsIG = {
-  igUserId: string;
-  pageToken: string;
-  caption: string;
-  media: Media[];
-};
-
-async function publishToInstagram({
-  igUserId,
-  pageToken,
-  caption,
-  media,
-}: PublishArgsIG) {
-  if (!media.length) {
-    throw new Error("no_media_for_ig");
-  }
-
-  const first = media[0];
-  const mt = (first.mime_type || "").toLowerCase();
-
-  const creation = new URL(`${FB_GRAPH}/${igUserId}/media`);
-  if (mt.startsWith("image/")) {
-    creation.searchParams.set("image_url", first.public_url as string);
-  } else if (mt.startsWith("video/")) {
-    creation.searchParams.set("media_type", "VIDEO");
-    creation.searchParams.set("video_url", first.public_url as string);
-  } else {
-    throw new Error(`unsupported_media_ig:${mt}`);
-  }
-
-  if (caption) {
-    creation.searchParams.set("caption", caption);
-  }
-  creation.searchParams.set("access_token", pageToken);
-
-  const cr = await fetch(creation, { method: "POST" });
-  const { ok: cOk, json: cJson, raw: cRaw } = await parseFB(cr);
-  if (!cOk || !cJson || !cJson.id) {
-    throw new Error(`ig_creation_failed:${cRaw}`);
-  }
-
-  // publish
-  const pub = new URL(`${FB_GRAPH}/${igUserId}/media_publish`);
-  pub.searchParams.set("creation_id", cJson.id as string);
-  pub.searchParams.set("access_token", pageToken);
-  const pr = await fetch(pub, { method: "POST" });
-  const { ok: pOk, json: pJson, raw: pRaw } = await parseFB(pr);
-  if (!pOk || !pJson || !pJson.id) {
-    throw new Error(`ig_publish_failed:${pRaw}`);
-  }
-
-  return { apiId: pJson.id as string | undefined };
 }

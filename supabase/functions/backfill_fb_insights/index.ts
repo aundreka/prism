@@ -1,5 +1,6 @@
 // supabase/functions/backfill_fb_insights/index.ts
 
+// deno-lint-ignore-file no-explicit-any
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -7,19 +8,21 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const GRAPH_BASE = "https://graph.facebook.com/v20.0";
 const DEFAULT_DAYS = 90;
 
-// Metrics to pull from FB Insights (must be valid for /{post-id}/insights)
-const FB_METRICS = [
-  "post_impressions",
-  "post_reactions_by_type_total",
-] as const;
+// We ONLY use reactions here. Impressions / engaged_users are deprecated / flaky.
+// We'll derive engagement + synthetic "impressions" ourselves.
+const FB_METRICS = ["post_reactions_by_type_total"] as const;
 
 type FbMetricName = (typeof FB_METRICS)[number];
 
-type AnalyticsMetric = "impressions" | "likes" | "comments" | "shares";
+type AnalyticsMetric =
+  | "impressions"
+  | "likes"
+  | "comments"
+  | "shares"
+  | "engagement";
 
 const METRIC_MAP: Record<FbMetricName, AnalyticsMetric | null> = {
-  post_impressions: "impressions",
-  post_reactions_by_type_total: "likes", // we sum reactions
+  post_reactions_by_type_total: "likes",
 };
 
 // ---- Types ---- //
@@ -30,11 +33,12 @@ type ConnectedMetaRow = {
   platform: "facebook";
   page_id: string | null;
   access_token: string | null;
+  is_active?: boolean | null;
 };
 
 type FbAttachment = {
-  media_type?: string; // "photo", "video", "share", "link", etc.
-  type?: string;       // sometimes present (e.g. "photo", "video_inline")
+  media_type?: string;
+  type?: string;
 };
 
 type FbPost = {
@@ -65,22 +69,24 @@ type FbEngagementFields = {
   shares?: { count?: number };
 };
 
+// 🔧 add page_id here
 type AnalyticsEventInsert = {
   user_id: string;
   platform: "facebook";
+  page_id: string | null;
   object_id: string;
   metric: AnalyticsMetric;
   value: number;
-  ts: string; // ISO timestamptz
+  ts: string;
 };
 
 type ExternalPostInsert = {
   user_id: string;
   platform: "facebook";
-  object_id: string; // FB post ID
+  object_id: string;
   page_id: string;
   caption: string | null;
-  content_type: string | null; // raw FB-ish type → normalized in DB by trigger
+  content_type: string | null;
   created_at: string;
 };
 
@@ -108,7 +114,6 @@ function daysAgoToUnix(days: number): number {
   return Math.floor(ms / 1000);
 }
 
-// Infer a usable content_type string from FB post fields
 function inferContentTypeFromPost(post: FbPost): string | null {
   const firstAttachment = post.attachments?.data?.[0];
 
@@ -116,7 +121,6 @@ function inferContentTypeFromPost(post: FbPost): string | null {
   const type = firstAttachment?.type?.toLowerCase();
   const statusType = post.status_type?.toLowerCase();
 
-  // Prefer explicit media_type
   if (mediaType) {
     if (mediaType.includes("photo") || mediaType === "image") return "photo";
     if (mediaType.includes("video")) return "video";
@@ -126,7 +130,6 @@ function inferContentTypeFromPost(post: FbPost): string | null {
     }
   }
 
-  // Fallback to attachment.type
   if (type) {
     if (type.includes("photo") || type === "image") return "photo";
     if (type.includes("video")) return "video";
@@ -134,14 +137,12 @@ function inferContentTypeFromPost(post: FbPost): string | null {
     if (type.includes("album") || type.includes("carousel")) return "carousel";
   }
 
-  // Fallback to status_type
   if (statusType) {
     if (statusType.includes("shared_story")) return "share";
     if (statusType.includes("added_photos")) return "photo";
     if (statusType.includes("added_video")) return "video";
   }
 
-  // Last resort: if there's a message only, treat as "status"
   if (post.message && !firstAttachment) {
     return "status";
   }
@@ -149,18 +150,21 @@ function inferContentTypeFromPost(post: FbPost): string | null {
   return null;
 }
 
-// Fetch connected FB accounts (optionally for one user)
 async function fetchConnectedFacebookAccounts(
   supabase: ReturnType<typeof createClient>,
   userId?: string,
+  pageId?: string,
 ): Promise<ConnectedMetaRow[]> {
   let query = supabase
     .from("connected_meta_accounts")
-    .select("id, user_id, platform, page_id, access_token")
+    .select("id, user_id, platform, page_id, access_token, is_active")
     .eq("platform", "facebook");
 
-  if (userId) {
-    query = query.eq("user_id", userId);
+  if (userId) query = query.eq("user_id", userId);
+  if (pageId) {
+    query = query.eq("page_id", pageId);
+  } else {
+    query = query.eq("is_active", true);
   }
 
   const { data, error } = await query;
@@ -169,7 +173,6 @@ async function fetchConnectedFacebookAccounts(
   return (data || []) as ConnectedMetaRow[];
 }
 
-// Fetch posts for a Page with caption + basic attachment metadata
 async function fetchPagePosts(
   pageId: string,
   accessToken: string,
@@ -177,7 +180,6 @@ async function fetchPagePosts(
 ): Promise<FbPost[]> {
   const allPosts: FbPost[] = [];
 
-  // We include attachments + status_type so we can infer content_type
   const fields = [
     "id",
     "created_time",
@@ -190,7 +192,7 @@ async function fetchPagePosts(
     `${GRAPH_BASE}/${pageId}/posts` +
     `?fields=${encodeURIComponent(fields)}` +
     `&limit=50&since=${sinceUnix}` +
-    `&access_token=${accessToken}`;
+    `&access_token=${encodeURIComponent(accessToken)}`;
 
   while (url) {
     const res = await fetch(url);
@@ -212,27 +214,73 @@ async function fetchPagePosts(
   return allPosts;
 }
 
-// Fetch insights for a single post (impressions, reactions)
+// Only likes via insights; comments/shares via edge fields
 async function fetchPostInsights(
   postId: string,
   accessToken: string,
 ): Promise<FbInsightsResponse["data"]> {
-  const metricsParam = FB_METRICS.join(",");
-  const url =
-    `${GRAPH_BASE}/${postId}/insights` +
-    `?metric=${metricsParam}&access_token=${accessToken}`;
+  const allData: FbInsightsResponse["data"] = [];
 
-  const res = await fetch(url);
-  if (!res.ok) {
-    console.error(`Error fetching insights for post ${postId}:`, await res.text());
-    return [];
+  for (const metric of FB_METRICS) {
+    const url =
+      `${GRAPH_BASE}/${postId}/insights` +
+      `?metric=${encodeURIComponent(metric)}` +
+      `&access_token=${encodeURIComponent(accessToken)}`;
+
+    const res = await fetch(url);
+    const txt = await res.text();
+
+    if (!res.ok) {
+      let json: any;
+      try {
+        json = JSON.parse(txt);
+      } catch {
+        console.error(
+          `Error fetching insights for post ${postId} metric ${metric}:`,
+          txt,
+        );
+        continue;
+      }
+
+      const err = json?.error;
+      if (
+        err?.code === 100 &&
+        typeof err?.message === "string" &&
+        err.message.includes("valid insights metric")
+      ) {
+        console.warn(
+          `Metric "${metric}" invalid for post ${postId}. Skipping this metric. Details:`,
+          err.message,
+        );
+        continue;
+      }
+
+      console.error(
+        `Error fetching insights for post ${postId} metric ${metric}:`,
+        json,
+      );
+      continue;
+    }
+
+    let json: FbInsightsResponse;
+    try {
+      json = JSON.parse(txt);
+    } catch {
+      console.error(
+        `Insights parse error for post ${postId} metric ${metric}:`,
+        txt,
+      );
+      continue;
+    }
+
+    if (Array.isArray(json.data) && json.data.length > 0) {
+      allData.push(...json.data);
+    }
   }
 
-  const json = (await res.json()) as FbInsightsResponse;
-  return json.data || [];
+  return allData;
 }
 
-// Fetch comments & shares (not via insights)
 async function fetchPostCommentShareCounts(
   postId: string,
   accessToken: string,
@@ -240,7 +288,7 @@ async function fetchPostCommentShareCounts(
   const url =
     `${GRAPH_BASE}/${postId}` +
     `?fields=comments.summary(true).limit(0),shares` +
-    `&access_token=${accessToken}`;
+    `&access_token=${encodeURIComponent(accessToken)}`;
 
   const res = await fetch(url);
   if (!res.ok) {
@@ -259,10 +307,11 @@ async function fetchPostCommentShareCounts(
   return { commentCount, shareCount };
 }
 
-// Convert FB insights (+ extra counts) to analytics_events rows
+// Build analytics rows, and ALSO synthesize engagement + impressions
 function buildAnalyticsEvents(
   args: {
     userId: string;
+    pageId: string | null;  // 🔧 include pageId in args
     postId: string;
     createdTime: string;
   },
@@ -273,15 +322,20 @@ function buildAnalyticsEvents(
 
   const base: Pick<
     AnalyticsEventInsert,
-    "user_id" | "platform" | "object_id" | "ts"
+    "user_id" | "platform" | "page_id" | "object_id" | "ts"
   > = {
     user_id: args.userId,
     platform: "facebook",
+    page_id: args.pageId,       // 🔧 set page_id
     object_id: args.postId,
-    ts: args.createdTime, // you could use last value's end_time instead, if you want
+    ts: args.createdTime,
   };
 
-  // From insights → impressions & likes
+  let likes = 0;
+  let comments = 0;
+  let shares = 0;
+
+  // From insights → likes
   for (const metric of insights) {
     const mapped = METRIC_MAP[metric.name as FbMetricName];
     if (!mapped) continue;
@@ -294,7 +348,6 @@ function buildAnalyticsEvents(
     if (typeof last.value === "number") {
       valueNumber = last.value;
     } else {
-      // reactions_by_type: sum all reaction counts
       valueNumber = Object.values(last.value).reduce(
         (sum, v) => sum + (typeof v === "number" ? v : 0),
         0,
@@ -302,6 +355,8 @@ function buildAnalyticsEvents(
     }
 
     if (!Number.isFinite(valueNumber)) continue;
+
+    if (mapped === "likes") likes += valueNumber;
 
     rows.push({
       ...base,
@@ -313,6 +368,7 @@ function buildAnalyticsEvents(
   // From extra → comments & shares
   if (extra) {
     if (extra.commentCount != null) {
+      comments += extra.commentCount;
       rows.push({
         ...base,
         metric: "comments",
@@ -320,6 +376,7 @@ function buildAnalyticsEvents(
       });
     }
     if (extra.shareCount != null) {
+      shares += extra.shareCount;
       rows.push({
         ...base,
         metric: "shares",
@@ -328,52 +385,64 @@ function buildAnalyticsEvents(
     }
   }
 
+  // Synthetic engagement & impressions = likes + comments + shares
+  const engagement = likes + comments + shares;
+
+  if (engagement > 0) {
+    rows.push({
+      ...base,
+      metric: "engagement",
+      value: engagement,
+    });
+    rows.push({
+      ...base,
+      metric: "impressions",
+      value: engagement,
+    });
+  }
+
   return rows;
 }
 
-// Upsert analytics_events
 async function insertAnalyticsEvents(
   supabase: ReturnType<typeof createClient>,
   rows: AnalyticsEventInsert[],
 ) {
   if (!rows.length) return { inserted: 0 };
 
-  const { error, count } = await supabase
+  const { error } = await supabase
     .from("analytics_events")
     .upsert(rows, {
       onConflict: "user_id,platform,object_id,metric,ts",
       ignoreDuplicates: true,
-    })
-    .select("id", { count: "exact", head: true });
+    });
 
   if (error) {
     console.error("Error inserting analytics_events:", error);
     throw error;
   }
 
-  return { inserted: count ?? 0 };
+  return { inserted: rows.length };
 }
 
-// Upsert external_posts (caption/content_type/etc.)
 async function insertExternalPosts(
   supabase: ReturnType<typeof createClient>,
   rows: ExternalPostInsert[],
 ) {
   if (!rows.length) return { inserted: 0 };
 
-  const { error, count } = await supabase
+  const { error } = await supabase
     .from("external_posts")
     .upsert(rows, {
       onConflict: "user_id,platform,object_id",
-    })
-    .select("id", { count: "exact", head: true });
+    });
 
   if (error) {
     console.error("Error inserting external_posts:", error);
     throw error;
   }
 
-  return { inserted: count ?? 0 };
+  return { inserted: rows.length };
 }
 
 // ---- Main handler ---- //
@@ -389,12 +458,17 @@ serve(async (req) => {
     const body = (await req.json().catch(() => ({}))) as {
       days?: number;
       userId?: string;
+      pageId?: string;
     };
 
     const days = body.days && body.days > 0 ? body.days : DEFAULT_DAYS;
     const sinceUnix = daysAgoToUnix(days);
 
-    const accounts = await fetchConnectedFacebookAccounts(supabase, body.userId);
+    const accounts = await fetchConnectedFacebookAccounts(
+      supabase,
+      body.userId,
+      body.pageId,
+    );
 
     let totalPosts = 0;
     let totalEvents = 0;
@@ -422,7 +496,6 @@ serve(async (req) => {
       console.log(`Found ${posts.length} posts for page ${account.page_id}`);
       totalPosts += posts.length;
 
-      // 1) Upsert external_posts for all posts
       const externalRows: ExternalPostInsert[] = posts.map((p) => {
         const contentType = inferContentTypeFromPost(p);
 
@@ -432,7 +505,7 @@ serve(async (req) => {
           object_id: p.id,
           page_id: account.page_id!,
           caption: p.message ?? null,
-          content_type: contentType, // DB trigger will map this → post_type_enum
+          content_type: contentType,
           created_at: p.created_time,
         };
       });
@@ -445,7 +518,6 @@ serve(async (req) => {
         );
       }
 
-      // 2) Fetch insights + comments/shares in small batches
       const BATCH_SIZE = 10;
 
       for (let i = 0; i < posts.length; i += BATCH_SIZE) {
@@ -462,6 +534,7 @@ serve(async (req) => {
           const rows = buildAnalyticsEvents(
             {
               userId: account.user_id,
+              pageId: account.page_id,          // 🔧 pass pageId through
               postId: post.id,
               createdTime: post.created_time,
             },
@@ -483,6 +556,10 @@ serve(async (req) => {
 
           console.log(
             `Inserted ${inserted} analytics_events rows for user ${account.user_id} (page ${account.page_id})`,
+          );
+        } else {
+          console.log(
+            `Inserted 0 analytics_events rows for user ${account.user_id} (page ${account.page_id})`,
           );
         }
       }

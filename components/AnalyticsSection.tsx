@@ -1,11 +1,6 @@
 // components/AnalyticsSection.tsx
 import React, { useMemo } from "react";
-import {
-  StyleSheet,
-  Text,
-  View,
-  TouchableOpacity,
-} from "react-native";
+import { StyleSheet, Text, View, TouchableOpacity } from "react-native";
 
 const TEXT = "#111827";
 const MUTED = "#6B7280";
@@ -63,7 +58,7 @@ type CombinedPostStat = {
   source: "app" | "manual";
   createdAt: Date;
   impressions: number;
-  engagement: number;
+  engagement: number; // always likes + comments + shares
 };
 
 type RecentPostCard = {
@@ -72,8 +67,7 @@ type RecentPostCard = {
   status: "Published" | "Scheduled" | "Draft";
   date: Date;
   platforms: PlatformEnum[];
-  impressions: number;
-  engRate: number;
+  engagement: number;
 };
 
 type Props = {
@@ -110,6 +104,7 @@ export const AnalyticsSection: React.FC<Props> = ({
 }) => {
   const dayMs = 24 * 60 * 60 * 1000;
 
+  // Bucket analytics metrics by object_id: { [metric]: max(value) }
   const analyticsByObject = useMemo(() => {
     const map = new Map<string, Record<string, number>>();
     for (const a of analytics) {
@@ -117,11 +112,13 @@ export const AnalyticsSection: React.FC<Props> = ({
       if (!map.has(a.object_id)) map.set(a.object_id, {});
       const bucket = map.get(a.object_id)!;
       const val = Number(a.value) || 0;
+      // Store the max we’ve seen for each metric for that object
       bucket[a.metric] = Math.max(bucket[a.metric] || 0, val);
     }
     return map;
   }, [analytics]);
 
+  // Stats for posts created in Prism (joined to scheduled/meta objects)
   const postStats = useMemo(() => {
     const stats: {
       post: PostRow;
@@ -147,7 +144,7 @@ export const AnalyticsSection: React.FC<Props> = ({
       let saves = 0;
       let clicks = 0;
       let videoViews = 0;
-      let engagement = 0;
+      let engagement = 0; // likes + comments + shares
       let latestAt: Date | null = null;
       const platforms = new Set<PlatformEnum>();
 
@@ -182,6 +179,11 @@ export const AnalyticsSection: React.FC<Props> = ({
         engagement += like + comm + sh;
       }
 
+      // If impressions are missing, fall back to engagement so we never divide by 0
+      if (impressions === 0 && engagement > 0) {
+        impressions = engagement;
+      }
+
       stats.push({
         post,
         impressions,
@@ -200,6 +202,7 @@ export const AnalyticsSection: React.FC<Props> = ({
     return stats;
   }, [posts, sched, analyticsByObject]);
 
+  // Combine metadata (caption, createdAt, source) per Meta object_id
   const combinedMetaByObject = useMemo(() => {
     const map = new Map<
       string,
@@ -253,6 +256,7 @@ export const AnalyticsSection: React.FC<Props> = ({
     return map;
   }, [externalPosts, sched, posts]);
 
+  // Combined stats per Meta object_id (last 30 days)
   const combinedStatsLast30 = useMemo<CombinedPostStat[]>(() => {
     const now = new Date();
     const start30 = new Date(now.getTime() - 29 * dayMs);
@@ -263,11 +267,16 @@ export const AnalyticsSection: React.FC<Props> = ({
       const bucket = analyticsByObject.get(objectId);
       if (!bucket) continue;
 
-      const impressions = bucket["impressions"] || 0;
       const likes = bucket["likes"] || 0;
       const comments = bucket["comments"] || 0;
       const shares = bucket["shares"] || 0;
+
       const engagement = likes + comments + shares;
+
+      let impressions = bucket["impressions"] || 0;
+      if (impressions === 0 && engagement > 0) {
+        impressions = engagement;
+      }
 
       if (impressions === 0 && engagement === 0) continue;
 
@@ -282,7 +291,7 @@ export const AnalyticsSection: React.FC<Props> = ({
     }
 
     return results;
-  }, [combinedMetaByObject, analyticsByObject]);
+  }, [combinedMetaByObject, analyticsByObject, dayMs]);
 
   const totalPostsWithAnalytics = useMemo(() => {
     let count = 0;
@@ -293,38 +302,36 @@ export const AnalyticsSection: React.FC<Props> = ({
   }, [combinedMetaByObject, analyticsByObject]);
 
   const postsLast7Count = useMemo(() => {
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - 6 * dayMs);
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - 6 * dayMs);
 
-  let count = 0;
-  for (const [objectId, meta] of combinedMetaByObject.entries()) {
-    // only count posts that actually have analytics
-    if (!analyticsByObject.has(objectId)) continue;
-    if (meta.createdAt >= cutoff) count++;
-  }
+    let count = 0;
 
-  return count;
-}, [combinedMetaByObject, analyticsByObject]);
+    for (const [objectId, meta] of combinedMetaByObject.entries()) {
+      // only count posts that actually have analytics
+      if (!analyticsByObject.has(objectId)) continue;
 
+      if (meta.createdAt >= cutoff) {
+        count++;
+      }
+    }
 
+    return count;
+  }, [combinedMetaByObject, analyticsByObject, dayMs]);
+
+  // KPI cards at the top
   const kpis = useMemo(() => {
     const totalPosts = totalPostsWithAnalytics;
     const postsThisWeek = postsLast7Count;
 
-    let totalImpressions30 = 0;
-    let sumEngRate30 = 0;
-    let countEngRate30 = 0;
+    let totalEngagement30 = 0;
 
     for (const s of combinedStatsLast30) {
-      totalImpressions30 += s.impressions;
-      if (s.impressions > 0) {
-        sumEngRate30 += s.engagement / s.impressions;
-        countEngRate30 += 1;
-      }
+      totalEngagement30 += s.engagement;
     }
 
-    const avgEngagementRate30 = countEngRate30
-      ? (sumEngRate30 / countEngRate30) * 100
+    const avgEngagementPerPost30 = combinedStatsLast30.length
+      ? totalEngagement30 / combinedStatsLast30.length
       : 0;
 
     return [
@@ -339,74 +346,21 @@ export const AnalyticsSection: React.FC<Props> = ({
         hint: "With analytics, last 7 days",
       },
       {
-        label: "Total Impressions (30d)",
-        value: formatNumber(totalImpressions30),
-        hint: "FB posts with analytics",
+        label: "Total Engagement (30d)",
+        value: formatNumber(totalEngagement30),
+        hint: "Likes + comments + shares",
       },
       {
-        label: "Avg Engagement Rate (30d)",
-        value: `${avgEngagementRate30.toFixed(1)}%`,
-        hint: "Posts with impressions",
+        label: "Avg Engagement / Post (30d)",
+        value: avgEngagementPerPost30.toFixed(1),
+        hint: "Based on posts with analytics",
       },
     ];
   }, [combinedStatsLast30, postsLast7Count, totalPostsWithAnalytics]);
 
-  const recentPosts: RecentPostCard[] = useMemo(() => {
-    const sortedPosts = [...posts].sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    );
-    const subset = sortedPosts.slice(0, 5);
-
-    return subset.map((post) => {
-      const stat =
-        postStats.find((s) => s.post.id === post.id) ?? null;
-      const srows = sched.filter((s) => s.post_id === post.id);
-
-      let status: "Published" | "Scheduled" | "Draft" = "Draft";
-      if (srows.some((s) => s.status === "posted")) status = "Published";
-      else if (
-        srows.some(
-          (s) =>
-            s.status === "scheduled" ||
-            s.status === "posting"
-        )
-      )
-        status = "Scheduled";
-
-      let date: Date = new Date(post.created_at);
-      const posted = srows
-        .filter((s) => s.posted_at)
-        .map((s) => new Date(s.posted_at!))
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-      const scheduled = srows
-        .filter((s) => s.scheduled_at)
-        .map((s) => new Date(s.scheduled_at!))
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-      if (posted) date = posted;
-      else if (scheduled) date = scheduled;
-
-      const platforms = stat ? Array.from(stat.platforms) : [];
-      const impressions = stat?.impressions || 0;
-      const engRate =
-        stat && stat.impressions > 0
-          ? (stat.engagement / stat.impressions) * 100
-          : 0;
-
-      return {
-        id: post.id,
-        caption: post.caption || "(no caption)",
-        status,
-        date,
-        platforms,
-        impressions,
-        engRate,
-      };
-    });
-  }, [posts, postStats, sched]);
-
+  // Engagement trend from dailyEng
   const engagementTrend = useMemo(() => {
-    if (!dailyEng.length) {
+    if (!dailyEng || dailyEng.length === 0) {
       return {
         series: [] as {
           key: string;
@@ -425,9 +379,7 @@ export const AnalyticsSection: React.FC<Props> = ({
 
       return {
         key: row.day,
-        label: d.toLocaleDateString(undefined, {
-          weekday: "short",
-        }),
+        label: d.toLocaleDateString(undefined, { weekday: "short" }),
         value,
       };
     });
@@ -435,22 +387,77 @@ export const AnalyticsSection: React.FC<Props> = ({
     return { series, maxVal };
   }, [dailyEng]);
 
-  const hasTrendData = engagementTrend.series.some((d) => d.value > 0);
+  // show the chart as long as we *have rows*, even if all are 0
+  const hasTrendData = !!dailyEng && dailyEng.length > 0;
 
-  // ALWAYS return { sorted, maxEng } so TS doesn’t get a union type
-  const topPostsLast30 = useMemo(
-    () => {
-      if (!combinedStatsLast30.length) {
-        return { sorted: [] as CombinedPostStat[], maxEng: 1 };
-      }
-      const sorted = [...combinedStatsLast30]
-        .sort((a, b) => b.engagement - a.engagement)
-        .slice(0, 5);
-      const maxEng = sorted[0]?.engagement || 1;
-      return { sorted, maxEng };
-    },
-    [combinedStatsLast30]
-  );
+  // Top posts (engagement-based) over last 30 days
+  const topPostsLast30 = useMemo(() => {
+    if (!combinedStatsLast30.length) {
+      return { sorted: [] as CombinedPostStat[], maxEng: 1 };
+    }
+    const sorted = [...combinedStatsLast30]
+      .sort((a, b) => b.engagement - a.engagement)
+      .slice(0, 5);
+    const maxEng = sorted[0]?.engagement || 1;
+    return { sorted, maxEng };
+  }, [combinedStatsLast30]);
+
+  // PAGE-SPECIFIC: only posts that are actually scheduled for this page
+  const recentPosts: RecentPostCard[] = useMemo(() => {
+    const schedPostIds = new Set(
+      sched
+        .map((s) => s.post_id)
+        .filter((id): id is string => !!id)
+    );
+
+    // Only include Prism posts that belong to a schedule row we received
+    const eligiblePosts = posts.filter((p) => schedPostIds.has(p.id));
+    if (eligiblePosts.length === 0) return [];
+
+    const sortedPosts = [...eligiblePosts].sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    const subset = sortedPosts.slice(0, 5);
+
+    return subset.map((post) => {
+      const stat = postStats.find((s) => s.post.id === post.id) ?? null;
+      const srows = sched.filter((s) => s.post_id === post.id);
+
+      let status: "Published" | "Scheduled" | "Draft" = "Draft";
+      if (srows.some((s) => s.status === "posted")) status = "Published";
+      else if (
+        srows.some(
+          (s) => s.status === "scheduled" || s.status === "posting"
+        )
+      )
+        status = "Scheduled";
+
+      let date: Date = new Date(post.created_at);
+      const posted = srows
+        .filter((s) => s.posted_at)
+        .map((s) => new Date(s.posted_at!))
+        .sort((a, b) => b.getTime() - a.getTime())[0];
+      const scheduled = srows
+        .filter((s) => s.scheduled_at)
+        .map((s) => new Date(s.scheduled_at!))
+        .sort((a, b) => b.getTime() - a.getTime())[0];
+      if (posted) date = posted;
+      else if (scheduled) date = scheduled;
+
+      const platforms = stat ? Array.from(stat.platforms) : [];
+      const engagement = stat?.engagement || 0;
+
+      return {
+        id: post.id,
+        caption: post.caption || "(no caption)",
+        status,
+        date,
+        platforms,
+        engagement,
+      };
+    });
+  }, [posts, sched, postStats]);
 
   return (
     <>
@@ -507,96 +514,95 @@ export const AnalyticsSection: React.FC<Props> = ({
             manual Facebook posts).
           </Text>
         ) : (
-          topPostsLast30.sorted.map(
-            (p: CombinedPostStat, idx: number) => {
-              const shortCaption =
-                p.caption.length > 24
-                  ? p.caption.slice(0, 24) + "…"
-                  : p.caption || "(no caption)";
-              const labelPrefix =
-                p.source === "app" ? "FB • App" : "FB • Manual";
+          topPostsLast30.sorted.map((p: CombinedPostStat, idx: number) => {
+            const shortCaption =
+              p.caption.length > 24
+                ? p.caption.slice(0, 24) + "…"
+                : p.caption || "(no caption)";
+            const labelPrefix =
+              p.source === "app" ? "FB • App" : "FB • Manual";
 
-              const engRate =
-                p.impressions > 0
-                  ? (p.engagement / p.impressions) * 100
-                  : 0;
-
-              return (
-                <View key={p.objectId} style={{ marginBottom: 10 }}>
-                  <Text style={styles.perfLabel}>
-                    {idx + 1}. {labelPrefix} • {shortCaption}
-                  </Text>
-                  <View style={styles.perfTrack}>
-                    <View
-                      style={[
-                        styles.perfFill,
-                        {
-                          // cast to any to satisfy TS while still passing a "%" string
-                          width: barWidthPct(
-                            p.engagement,
-                            topPostsLast30.maxEng
-                          ) as any,
-                        },
-                      ]}
-                    />
-                  </View>
-                  <Text style={styles.perfMeta}>
-                    Engagement: {formatNumber(p.engagement)} • Impressions:{" "}
-                    {formatNumber(p.impressions)} • Eng. rate:{" "}
-                    {engRate.toFixed(1)}%
-                  </Text>
+            return (
+              <View key={p.objectId} style={{ marginBottom: 10 }}>
+                <Text style={styles.perfLabel}>
+                  {idx + 1}. {labelPrefix} • {shortCaption}
+                </Text>
+                <View style={styles.perfTrack}>
+                  <View
+                    style={[
+                      styles.perfFill,
+                      {
+                        width: barWidthPct(
+                          p.engagement,
+                          topPostsLast30.maxEng
+                        ) as any,
+                      },
+                    ]}
+                  />
                 </View>
-              );
-            }
-          )
+                <Text style={styles.perfMeta}>
+                  Engagement: {formatNumber(p.engagement)}
+                </Text>
+              </View>
+            );
+          })
         )}
       </View>
 
       {/* Recent Posts (Created in Prism) */}
       <Text style={styles.sectionTitle}>Recent Posts (Created in Prism)</Text>
-      {recentPosts.map((p) => (
-        <TouchableOpacity
-          key={p.id}
-          style={styles.postCard}
-          activeOpacity={0.85}
-        >
-          <View style={styles.rowBetween}>
-            <View style={styles.row}>
-              {p.platforms.length > 0 && (
-                <View
-                  style={[
-                    styles.statusPill,
-                    styles.pillFB,
-                    { marginRight: 6 },
-                  ]}
-                >
-                  <Text style={styles.pillText}>FB</Text>
-                </View>
-              )}
+      {recentPosts.length === 0 ? (
+        <View style={styles.card}>
+          <Text style={{ color: MUTED, fontSize: 12 }}>
+            No posts created in Prism yet for this Page.
+          </Text>
+        </View>
+      ) : (
+        recentPosts.map((p) => (
+          <TouchableOpacity
+            key={p.id}
+            style={styles.postCard}
+            activeOpacity={0.85}
+          >
+            <View style={styles.rowBetween}>
+              <View style={styles.row}>
+                {p.platforms.length > 0 && (
+                  <View
+                    style={[
+                      styles.statusPill,
+                      styles.pillFB,
+                      { marginRight: 6 },
+                    ]}
+                  >
+                    <Text style={styles.pillText}>FB</Text>
+                  </View>
+                )}
+              </View>
+              <View
+                style={[
+                  styles.statusPill,
+                  p.status === "Published"
+                    ? styles.pillPublished
+                    : p.status === "Scheduled"
+                    ? styles.pillScheduled
+                    : styles.pillDraft,
+                ]}
+              >
+                <Text style={styles.pillText}>{p.status}</Text>
+              </View>
             </View>
-            <View
-              style={[
-                styles.statusPill,
-                p.status === "Published"
-                  ? styles.pillPublished
-                  : p.status === "Scheduled"
-                  ? styles.pillScheduled
-                  : styles.pillDraft,
-              ]}
-            >
-              <Text style={styles.pillText}>{p.status}</Text>
-            </View>
-          </View>
-          <Text style={styles.postCaption}>{p.caption}</Text>
-          <Text style={styles.postDate}>{p.date.toLocaleDateString()}</Text>
-          {p.impressions > 0 && (
-            <Text style={styles.postMeta}>
-              Impressions: {formatNumber(p.impressions)} • Eng. rate:{" "}
-              {p.engRate.toFixed(1)}%
+            <Text style={styles.postCaption}>{p.caption}</Text>
+            <Text style={styles.postDate}>
+              {p.date.toLocaleDateString()}
             </Text>
-          )}
-        </TouchableOpacity>
-      ))}
+            {p.engagement > 0 && (
+              <Text style={styles.postMeta}>
+                Engagement: {formatNumber(p.engagement)}
+              </Text>
+            )}
+          </TouchableOpacity>
+        ))
+      )}
     </>
   );
 };

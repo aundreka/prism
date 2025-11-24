@@ -82,6 +82,12 @@ type SmartPlanSlot = {
   brief: SmartPlanBrief | null;
 };
 
+type ActivePageRow = {
+  page_id: string | null;
+  page_name: string | null;
+  is_active: boolean | null;
+};
+
 const BG = "#F8FAFC";
 const TEXT = "#111827";
 const MUTED = "#6B7280";
@@ -637,7 +643,7 @@ function getIndustrySpecificAngles(industry?: string | null): string[] {
     return INDUSTRY_ANGLE_POOLS[key];
   }
 
-  // Fuzzy fallbacks (if your enum names differ)
+  // Fuzzy fallbacks
   if (key.includes("school") || key.includes("org")) {
     return INDUSTRY_ANGLE_POOLS["education"] ?? [];
   }
@@ -679,9 +685,8 @@ function getIndustrySpecificAngles(industry?: string | null): string[] {
 function buildAnglePoolForIndustry(industry?: string | null): string[] {
   const universal = UNIVERSAL_ANGLES;
   const specific = getIndustrySpecificAngles(industry);
-  // de-dup
   const merged = [...universal, ...specific];
-  return Array.from(new Set(merged));
+  return Array.from(new Set(merged)); // de-dup
 }
 
 /* ============================================================
@@ -697,6 +702,8 @@ export default function Home() {
   const [analytics, setAnalytics] = useState<AnalyticsRow[]>([]);
   const [externalPosts, setExternalPosts] = useState<ExternalPostRow[]>([]);
   const [dailyEng, setDailyEng] = useState<DailyEngRow[]>([]);
+
+  const [activePage, setActivePage] = useState<ActivePageRow | null>(null);
 
   // 7-Day Smart Plan state
   const [smartPlan, setSmartPlan] = useState<SmartPlanSlot[] | null>(null);
@@ -715,7 +722,28 @@ export default function Home() {
           return;
         }
 
-        // 1) Backfill FB insights (manual + API posts)
+        // 0) Figure out active page (or first page)
+        let activePageRow: ActivePageRow | null = null;
+        try {
+          const { data: connRows, error: connErr } = await supabase
+            .from("connected_meta_accounts")
+            .select("page_id, page_name, is_active")
+            .eq("platform", "facebook");
+
+          if (connErr) {
+            console.log("connected_meta_accounts error:", connErr);
+          } else if (connRows && connRows.length > 0) {
+            const rows = connRows as ActivePageRow[];
+            const foundActive = rows.find((r) => r.is_active);
+            activePageRow = foundActive ?? rows[0];
+          }
+        } catch (err) {
+          console.log("loadDashboard: active page lookup failed:", err);
+        }
+        setActivePage(activePageRow);
+        const activePageId = activePageRow?.page_id ?? null;
+
+        // 1) Backfill FB insights (manual + API posts) for this user
         try {
           const { data: fbData, error: fbError } =
             await supabase.functions.invoke("backfill_fb_insights", {
@@ -758,38 +786,52 @@ export default function Home() {
         const postsData = (p || []) as PostRow[];
         setPosts(postsData);
 
-        // 4) Schedules for these posts (FB only)
+        // 4) Schedules for these posts (FB only, scoped by page_id if present)
         let schedData: SchedRow[] = [];
         if (postsData.length) {
           const postIds = postsData.map((x) => x.id);
-          const { data: s, error: es } = await supabase
+          let schedQuery = supabase
             .from("scheduled_posts")
             .select(
-              "id,post_id,status,platform,api_post_id,scheduled_at,posted_at"
+              "id,post_id,status,platform,api_post_id,scheduled_at,posted_at,page_id"
             )
             .in("post_id", postIds)
             .eq("platform", "facebook")
             .order("scheduled_at", { ascending: false });
+
+          if (activePageId) {
+            schedQuery = schedQuery.eq("page_id", activePageId);
+          }
+
+          const { data: s, error: es } = await schedQuery;
           if (es) throw es;
-          schedData = (s || []) as SchedRow[];
+          // We ignore page_id in the TS type; it's only used for filtering.
+          schedData = (s || []) as any as SchedRow[];
         }
         setSched(schedData);
 
-        // 5) external_posts (manual + API posts)
-        const { data: ex, error: eEx } = await supabase
+        // 5) external_posts (manual + API posts) — scoped to active page if present
+        let exQuery = supabase
           .from("external_posts")
-          .select("object_id, caption, content_type, created_at")
+          .select("object_id, caption, content_type, created_at, page_id")
           .eq("user_id", user.id)
-          .eq("platform", "facebook")
+          .eq("platform", "facebook");
+
+        if (activePageId) {
+          exQuery = exQuery.eq("page_id", activePageId);
+        }
+
+        const { data: ex, error: eEx } = await exQuery
           .order("created_at", { ascending: false })
           .limit(300);
+
         if (eEx) {
           console.log("external_posts error:", eEx);
         }
-        const externalData = (ex || []) as ExternalPostRow[];
+        const externalData = (ex || []) as any as ExternalPostRow[];
         setExternalPosts(externalData);
 
-        // 6) analytics_events for all relevant object_ids
+        // 6) analytics_events for all relevant object_ids (posts + external posts)
         const objectIdsSet = new Set<string>();
         for (const s of schedData) {
           if (s.api_post_id) objectIdsSet.add(s.api_post_id);
@@ -812,14 +854,20 @@ export default function Home() {
           setAnalytics([]);
         }
 
-        // 7) Daily engagement (from v_user_recent_engagement)
-        const { data: engRows, error: eEng } = await supabase
+        // 7) Daily engagement (from v_user_recent_engagement) scoped by page_id
+        let engQuery = supabase
           .from("v_user_recent_engagement")
           .select("day, engagement")
           .eq("user_id", user.id)
           .eq("platform", "facebook")
           .order("day", { ascending: true })
           .limit(7);
+
+        if (activePageId) {
+          engQuery = engQuery.eq("page_id", activePageId);
+        }
+
+        const { data: engRows, error: eEng } = await engQuery;
         if (eEng) {
           console.log("v_user_recent_engagement error:", eEng);
         }
@@ -839,6 +887,7 @@ export default function Home() {
     try {
       setLoading(true);
 
+      // Run insights_pull once (global) to keep analytics fresh.
       const { data, error } = await supabase.functions.invoke("insights_pull", {
         body: {},
       });
@@ -891,12 +940,6 @@ export default function Home() {
 
   /**
    * 7-Day Smart Plan generator
-   *
-   * From the mobile app:
-   * 1) rpc('generate_7day_smart_plan', { p_platform: 'facebook', p_n_slots: 7 })
-   * 2) rpc('get_content_mix_recommendations', { p_platform: 'facebook' })
-   * 3) select from v_segment_engagement_scores
-   * 4) invoke edge function 'generate_smart_plan_briefs' (OpenAI) to get hook/caption/CTA/visual
    */
   const loadSmartPlan = useCallback(async () => {
     try {
@@ -909,7 +952,7 @@ export default function Home() {
         return;
       }
 
-      // --- NEW: fetch brand industry to bias angle selection ---
+      // --- Fetch brand industry to bias angle selection ---
       let brandIndustry: string | null = null;
       try {
         const { data: brandRows, error: brandErr } = await supabase
@@ -920,7 +963,6 @@ export default function Home() {
         if (brandErr) {
           console.log("brand_profiles error:", brandErr);
         } else if (brandRows && brandRows.length > 0) {
-          // industry is enum in DB, string in JS
           brandIndustry = (brandRows[0] as any).industry ?? null;
         }
       } catch (e) {
@@ -952,7 +994,7 @@ export default function Home() {
         return;
       }
 
-      // 2) Get content mix response (what types/angles tend to work)
+      // 2) Get content mix response
       const { data: mixData, error: mixErr } = await supabase.rpc(
         "get_content_mix_recommendations",
         { p_platform: "facebook" }
@@ -961,10 +1003,9 @@ export default function Home() {
         console.error("get_content_mix_recommendations error:", mixErr);
         throw mixErr;
       }
-
       const mixArr: any[] = (mixData || []) as any[];
 
-      // 3) Segment scores (who tends to respond)
+      // 3) Segment scores
       const { data: segRows, error: segErr } = await supabase
         .from("v_segment_engagement_scores")
         .select("segment_id, segment_engagement_rate, segment_name, platform")
@@ -973,18 +1014,14 @@ export default function Home() {
 
       if (segErr) {
         console.error("v_segment_engagement_scores error:", segErr);
-        // Not fatal; we can still make a plan without segments
       }
-
       const segArr: any[] = (segRows || []) as any[];
 
-      // Sort mixes and segments by their scores (if present)
       const sortedMix = [...mixArr].sort(
         (a, b) =>
           (b.expected_engagement_rate ?? 0) -
           (a.expected_engagement_rate ?? 0)
       );
-
       const sortedSegments = [...segArr].sort(
         (a, b) =>
           (b.segment_engagement_rate ?? 0) -
@@ -994,7 +1031,7 @@ export default function Home() {
       const mixLen = Math.max(sortedMix.length, 1);
       const segLen = Math.max(sortedSegments.length || 0, 1);
 
-      // 4) Assign content_type + objective + angle + segment locally (simple greedy)
+      // 4) Assign content_type + objective + angle + segment
       const designedSlots: SmartPlanSlot[] = baseSlotsArr.map(
         (raw: any, idx: number) => {
           const mix = sortedMix[idx % mixLen] || {};
@@ -1003,8 +1040,6 @@ export default function Home() {
               ? sortedSegments[idx % segLen] || {}
               : {};
 
-          // Prefer learned mix angle if it's specific (not "generic");
-          // fall back to curated angle pool for this industry.
           const mixAngle =
             typeof mix.angle === "string" && mix.angle !== "generic"
               ? mix.angle
@@ -1031,7 +1066,7 @@ export default function Home() {
         }
       );
 
-      // 5) Call OpenAI Edge Function to generate actual creative briefs
+      // 5) Call OpenAI Edge Function to generate creative briefs
       const { data: briefResp, error: briefErr } =
         await supabase.functions.invoke("generate_smart_plan_briefs", {
           body: {
@@ -1091,7 +1126,6 @@ export default function Home() {
           "Draft schedules created from your 7-day plan."
         );
 
-        // Reload dashboard so new drafts appear
         await loadDashboard({ silent: true });
       } catch (e: any) {
         console.error("handleApplySmartPlan error:", e);
@@ -1122,173 +1156,199 @@ export default function Home() {
     );
   }
 
+  const activePageLabel =
+    activePage?.page_name || activePage?.page_id || "No page connected";
+
+  // ✅ CHANGED: Wrap ScrollView in a View + use flex + flexGrow so PTR works
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={{ paddingBottom: 80, paddingTop: 110 }}
-      showsVerticalScrollIndicator={false}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
-      }
-    >
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.title}>Insights & Analytics</Text>
-        <Text style={styles.subtitle}>
-          {new Date().toLocaleDateString(undefined, {
-            weekday: "long",
-            month: "long",
-            day: "numeric",
-          })}
-        </Text>
-      </View>
-
-      {/* 7-Day Smart Plan */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeaderRow}>
-          <View style={{ flex: 1, paddingRight: 8 }}>
-            <Text style={styles.sectionTitle}>PRISM 7-Day Smart Plan</Text>
-            <Text style={styles.sectionSubtitle}>
-              Auto-generated schedule & content ideas from your data, goals,
-              audience segments, and angle playbook.
+    <View style={styles.container}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{
+          paddingBottom: 80,
+          paddingTop: 110,
+          flexGrow: 1,
+        }}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
+        }
+      >
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.title}>Insights & Analytics</Text>
+          <View style={styles.headerRow}>
+            <Text style={styles.subtitle}>
+              {new Date().toLocaleDateString(undefined, {
+                weekday: "long",
+                month: "long",
+                day: "numeric",
+              })}
             </Text>
-          </View>
-          <View style={styles.sectionHeaderActions}>
-            <TouchableOpacity
-              style={styles.primaryButton}
-              onPress={loadSmartPlan}
-              disabled={smartPlanLoading}
-            >
-              {smartPlanLoading ? (
-                <ActivityIndicator size="small" color="#FFFFFF" />
-              ) : (
-                <Text style={styles.primaryButtonText}>Generate Plan</Text>
-              )}
-            </TouchableOpacity>
-
-            {smartPlan && smartPlan.length > 0 && (
-              <TouchableOpacity
-                style={[
-                  styles.ghostButton,
-                  applyingSmartPlan && { opacity: 0.6 },
-                ]}
-                onPress={handleApplySmartPlan}
-                disabled={applyingSmartPlan}
-              >
-                {applyingSmartPlan ? (
-                  <ActivityIndicator size="small" />
-                ) : (
-                  <Text style={styles.ghostButtonText}>Convert to Drafts</Text>
-                )}
-              </TouchableOpacity>
+            {activePage && (
+              <View style={styles.pageTag}>
+                <Text style={styles.pageTagLabel}>Using page</Text>
+                <Text style={styles.pageTagValue} numberOfLines={1}>
+                  {activePageLabel}
+                </Text>
+              </View>
             )}
           </View>
         </View>
 
-        {smartPlanLoading && !smartPlan && (
-          <View
-            style={{
-              marginTop: 12,
-              flexDirection: "row",
-              alignItems: "center",
-            }}
-          >
-            <ActivityIndicator />
-            <Text style={{ marginLeft: 8, color: MUTED, fontSize: 13 }}>
-              Analysing your data and building a 7-day plan…
-            </Text>
+        {/* 7-Day Smart Plan */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeaderRow}>
+            <View style={{ flex: 1, paddingRight: 8 }}>
+              <Text style={styles.sectionTitle}>PRISM 7-Day Smart Plan</Text>
+              <Text style={styles.sectionSubtitle}>
+                Auto-generated schedule & content ideas from your data, goals,
+                audience segments, and angle playbook.
+              </Text>
+            </View>
+            <View style={styles.sectionHeaderActions}>
+              <TouchableOpacity
+                style={styles.primaryButton}
+                onPress={loadSmartPlan}
+                disabled={smartPlanLoading}
+              >
+                {smartPlanLoading ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.primaryButtonText}>Generate Plan</Text>
+                )}
+              </TouchableOpacity>
+
+              {smartPlan && smartPlan.length > 0 && (
+                <TouchableOpacity
+                  style={[
+                    styles.ghostButton,
+                    applyingSmartPlan && { opacity: 0.6 },
+                  ]}
+                  onPress={handleApplySmartPlan}
+                  disabled={applyingSmartPlan}
+                >
+                  {applyingSmartPlan ? (
+                    <ActivityIndicator size="small" />
+                  ) : (
+                    <Text style={styles.ghostButtonText}>
+                      Convert to Drafts
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
-        )}
 
-        {!smartPlanLoading && (!smartPlan || smartPlan.length === 0) && (
-          <Text style={styles.emptyText}>
-            Tap “Generate Plan” to see your recommended 7-day content schedule,
-            including formats, angles, and suggested captions.
-          </Text>
-        )}
+          {smartPlanLoading && !smartPlan && (
+            <View
+              style={{
+                marginTop: 12,
+                flexDirection: "row",
+                alignItems: "center",
+              }}
+            >
+              <ActivityIndicator />
+              <Text style={{ marginLeft: 8, color: MUTED, fontSize: 13 }}>
+                Analysing your data and building a 7-day plan…
+              </Text>
+            </View>
+          )}
 
-        {!smartPlanLoading && smartPlan && smartPlan.length > 0 && (
-          <View style={styles.planList}>
-            {smartPlan.map((slot) => {
-              const dt = new Date(slot.timeslot);
-              const dayLabel = dt.toLocaleDateString(undefined, {
-                weekday: "short",
-                month: "short",
-                day: "numeric",
-              });
-              const timeLabel = dt.toLocaleTimeString(undefined, {
-                hour: "numeric",
-                minute: "2-digit",
-              });
+          {!smartPlanLoading && (!smartPlan || smartPlan.length === 0) && (
+            <Text style={styles.emptyText}>
+              Tap “Generate Plan” to see your recommended 7-day content
+              schedule, including formats, angles, and suggested captions.
+            </Text>
+          )}
 
-              return (
-                <View key={slot.slot_index} style={styles.planItem}>
-                  <View style={styles.planItemHeaderRow}>
-                    <Text style={styles.planItemDay}>{dayLabel}</Text>
-                    <Text style={styles.planItemTime}>{timeLabel}</Text>
-                  </View>
+          {!smartPlanLoading && smartPlan && smartPlan.length > 0 && (
+            <View style={styles.planList}>
+              {smartPlan.map((slot) => {
+                const dt = new Date(slot.timeslot);
+                const dayLabel = dt.toLocaleDateString(undefined, {
+                  weekday: "short",
+                  month: "short",
+                  day: "numeric",
+                });
+                const timeLabel = dt.toLocaleTimeString(undefined, {
+                  hour: "numeric",
+                  minute: "2-digit",
+                });
 
-                  <View style={styles.chipRow}>
-                    <View style={styles.chipPrimary}>
-                      <Text style={styles.chipPrimaryText}>
-                        {slot.content_type.toUpperCase()}
-                      </Text>
+                return (
+                  <View key={slot.slot_index} style={styles.planItem}>
+                    <View style={styles.planItemHeaderRow}>
+                      <Text style={styles.planItemDay}>{dayLabel}</Text>
+                      <Text style={styles.planItemTime}>{timeLabel}</Text>
                     </View>
-                    <View style={styles.chip}>
-                      <Text style={styles.chipText}>
-                        Objective: {slot.objective}
-                      </Text>
+
+                    <View style={styles.chipRow}>
+                      <View style={styles.chipPrimary}>
+                        <Text style={styles.chipPrimaryText}>
+                          {slot.content_type.toUpperCase()}
+                        </Text>
+                      </View>
+                      <View style={styles.chip}>
+                        <Text style={styles.chipText}>
+                          Objective: {slot.objective}
+                        </Text>
+                      </View>
+                      <View style={styles.chip}>
+                        <Text style={styles.chipText}>
+                          Angle: {slot.angle}
+                        </Text>
+                      </View>
+                      {slot.segment_name && (
+                        <View style={styles.chipMuted}>
+                          <Text style={styles.chipMutedText}>
+                            Segment: {slot.segment_name}
+                          </Text>
+                        </View>
+                      )}
                     </View>
-                    <View style={styles.chip}>
-                      <Text style={styles.chipText}>Angle: {slot.angle}</Text>
-                    </View>
-                    {slot.segment_name && (
-                      <View style={styles.chipMuted}>
-                        <Text style={styles.chipMutedText}>
-                          Segment: {slot.segment_name}
+
+                    {slot.brief && (
+                      <View style={{ marginTop: 8 }}>
+                        <Text style={styles.briefLabel}>Hook</Text>
+                        <Text style={styles.briefText}>
+                          {slot.brief.hook}
+                        </Text>
+
+                        <Text style={styles.briefLabel}>Caption idea</Text>
+                        <Text style={styles.briefText} numberOfLines={3}>
+                          {slot.brief.caption}
+                        </Text>
+
+                        <Text style={styles.briefLabel}>CTA</Text>
+                        <Text style={styles.briefText}>{slot.brief.cta}</Text>
+
+                        <Text style={styles.briefLabel}>Suggested visual</Text>
+                        <Text style={styles.briefText}>
+                          {slot.brief.visual_idea}
                         </Text>
                       </View>
                     )}
                   </View>
+                );
+              })}
+            </View>
+          )}
+        </View>
 
-                  {slot.brief && (
-                    <View style={{ marginTop: 8 }}>
-                      <Text style={styles.briefLabel}>Hook</Text>
-                      <Text style={styles.briefText}>{slot.brief.hook}</Text>
+        {/* Smart Recommendations (Thompson Sampling) */}
+        <SmartRecommendationsCard />
 
-                      <Text style={styles.briefLabel}>Caption idea</Text>
-                      <Text style={styles.briefText} numberOfLines={3}>
-                        {slot.brief.caption}
-                      </Text>
-
-                      <Text style={styles.briefLabel}>CTA</Text>
-                      <Text style={styles.briefText}>{slot.brief.cta}</Text>
-
-                      <Text style={styles.briefLabel}>Suggested visual</Text>
-                      <Text style={styles.briefText}>
-                        {slot.brief.visual_idea}
-                      </Text>
-                    </View>
-                  )}
-                </View>
-              );
-            })}
-          </View>
-        )}
-      </View>
-
-      {/* Smart Recommendations (Thompson Sampling) */}
-      <SmartRecommendationsCard />
-
-      {/* Analytics (KPIs, trends, top posts, recent posts) */}
-      <AnalyticsSection
-        posts={posts}
-        sched={sched}
-        analytics={analytics}
-        externalPosts={externalPosts}
-        dailyEng={dailyEng}
-      />
-    </ScrollView>
+        {/* Analytics (KPIs, trends, top posts, recent posts) */}
+        <AnalyticsSection
+          posts={posts}
+          sched={sched}
+          analytics={analytics}
+          externalPosts={externalPosts}
+          dailyEng={dailyEng}
+        />
+      </ScrollView>
+    </View>
   );
 }
 
@@ -1296,7 +1356,31 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
   header: { paddingHorizontal: 16, marginBottom: 12 },
   title: { fontSize: 22, fontWeight: "700", color: TEXT },
-  subtitle: { color: MUTED, fontSize: 13 },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 4,
+  },
+  subtitle: { color: MUTED, fontSize: 13, flex: 1, marginRight: 8 },
+  pageTag: {
+    flexDirection: "column",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#EEF2FF",
+    borderRadius: 999,
+    maxWidth: "60%",
+  },
+  pageTagLabel: {
+    fontSize: 10,
+    color: "#4B5563",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  pageTagValue: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#111827",
+  },
 
   /* Smart Plan section */
   section: {

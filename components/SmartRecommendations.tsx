@@ -1,4 +1,4 @@
-// components/SmartRecommendationsCard.tsx
+// components/SmartRecommendations.tsx
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -60,7 +60,6 @@ export const SmartRecommendationsCard: React.FC = () => {
         weightBandit: 0.3,
       });
 
-      // Only FB (your current app)
       const fbOnly = data.filter((d) => d.platform === "facebook");
       setRecs(fbOnly);
     } catch (err: any) {
@@ -78,10 +77,7 @@ export const SmartRecommendationsCard: React.FC = () => {
     loadRecommendations();
   }, [loadRecommendations]);
 
-  const topTimeRecs = useMemo(
-    () => recs.slice(0, 5),
-    [recs]
-  );
+  const topTimeRecs = useMemo(() => recs.slice(0, 5), [recs]);
 
   const recCalendar: DayCalendar[] = useMemo(() => {
     if (!recs.length) return [];
@@ -105,7 +101,6 @@ export const SmartRecommendationsCard: React.FC = () => {
 
       rawMap.get(key)!.slots.push({
         hour: d.getHours(),
-        // Use the hybrid Thompson-sampled score as the main value
         score: r.hybridSample,
       });
     }
@@ -160,7 +155,8 @@ export const SmartRecommendationsCard: React.FC = () => {
       {!loadingRecs && !recError && !hasRecs && (
         <Text style={styles.mutedText}>
           Not enough engagement data yet. Once your posts start getting
-          activity, we’ll recommend the best upcoming times.
+          likes, comments, and shares, we’ll recommend the best upcoming
+          times.
         </Text>
       )}
 
@@ -178,10 +174,7 @@ export const SmartRecommendationsCard: React.FC = () => {
               return (
                 <TouchableOpacity
                   key={day.key}
-                  style={[
-                    styles.recDayCell,
-                    isToday && styles.recDayToday,
-                  ]}
+                  style={[styles.recDayCell, isToday && styles.recDayToday]}
                   activeOpacity={0.8}
                   onPress={() => router.push("/calendar")}
                 >
@@ -247,9 +240,7 @@ export const SmartRecommendationsCard: React.FC = () => {
                           {formatTimeSlot(r.timeslot)}
                         </Text>
                       </View>
-                      <Text style={styles.pmValue}>
-                        Score: {scorePct}
-                      </Text>
+                      <Text style={styles.pmValue}>Score: {scorePct}</Text>
                     </View>
                   </View>
                 );
@@ -281,16 +272,13 @@ export const SmartRecommendationsCard: React.FC = () => {
                 <View style={styles.mathStepBody}>
                   <Text style={styles.mathText}>
                     From your post analytics, we build hourly engagement
-                    features and normalize them into a{" "}
-                    <Text style={styles.codeText}>label_engagement</Text> score
-                    between 0 and 1.
-                  </Text>
-                  <View style={styles.formulaWrapper}>
-                    <Text style={styles.mathFormula}>
-                      engagement_rate = (likes + comments + 0.5·saves +
-                      0.2·shares) / impressions
+                    features based on your real interactions:
+                    {" "}
+                    <Text style={styles.codeText}>
+                      engagement = likes + comments + shares
                     </Text>
-                  </View>
+                    . We normalize this to a 0–1 score per slot.
+                  </Text>
                 </View>
               </View>
 
@@ -314,11 +302,11 @@ export const SmartRecommendationsCard: React.FC = () => {
                     We keep a Bayesian posterior over engagement for each
                     (day, hour, segment, post type) context in{" "}
                     <Text style={styles.codeText}>v_bandit_params</Text> with
-                    parameters α and β.
+                    parameters α and β, and sample:
                   </Text>
                   <View style={styles.formulaWrapper}>
                     <Text style={styles.mathFormula}>
-                      θ ~ Beta(α, β) (Thompson Sampling)
+                      θ ~ Beta(α, β)
                     </Text>
                   </View>
                 </View>
@@ -416,7 +404,6 @@ const styles = StyleSheet.create({
   recSlotTime: { fontSize: 11, color: "#111827" },
   recSlotScore: { fontSize: 11, color: "#0EA5E9", fontWeight: "600" },
 
-  // math box
   mathToggleRow: {
     marginTop: 16,
     flexDirection: "row",
