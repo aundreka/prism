@@ -2639,83 +2639,90 @@ returns table (
   content_score   numeric,
   combined_score  numeric
 )
-language sql
+language plpgsql
 security definer
 set search_path = public
 as $$
-with me as (
-  select auth.uid() as user_id
-),
+declare
+  v_user_id         uuid;
+  v_industry        text;
+  v_prior_time      numeric := 0.20; -- default time prior
+  v_bandit_alpha    numeric;
+  v_bandit_beta     numeric;
+  v_bandit_mean     numeric;
+  v_time_score      numeric;
 
--- 1) Time-based score (global + industry-specific prior)
-brand as (
-  select
-    bp.user_id,
-    bp.industry
+  v_content_score   numeric := 0.05; -- default content prior
+
+begin
+  -- current user
+  select auth.uid() into v_user_id;
+
+  -- brand industry (if any)
+  select bp.industry
+  into v_industry
   from public.brand_profiles bp
-  join me on me.user_id = bp.user_id
-),
+  where bp.user_id = v_user_id
+  limit 1;
 
-time_base as (
-  select
-    ghp.prior_score as prior_score
+  -- 1) TIME PRIOR: try to get from global_hourly_priors (industry-specific first, then generic)
+  select ghp.prior_score
+  into v_prior_time
   from public.global_hourly_priors ghp
-  join brand b
-    on b.industry = ghp.industry
   where ghp.platform = p_platform
-    and ghp.dow      = p_dow
-    and ghp.hour     = p_hour
-  limit 1
-),
+    and ghp.dow = p_dow
+    and ghp.hour = p_hour
+    and (
+      (v_industry is not null and ghp.industry = v_industry)
+      or (v_industry is null)
+    )
+  order by
+    case when v_industry is not null and ghp.industry = v_industry then 0 else 1 end
+  limit 1;
 
-time_with_bandit as (
-  select
-    coalesce(tb.prior_score, 0.2::numeric) as prior_score,
-    bp.bandit_alpha,
-    bp.bandit_beta,
-    case
-      when bp.bandit_alpha is null or bp.bandit_beta is null then
-        coalesce(tb.prior_score, 0.2::numeric)
-      else
-        -- blend prior + learned bandit mean
-        0.7 * coalesce(tb.prior_score, 0.2::numeric)
-        + 0.3 * (bp.bandit_alpha::numeric /
-                 nullif(bp.bandit_alpha + bp.bandit_beta, 0))
-    end as time_score
-  from time_base tb
-  cross join me
-  left join public.v_bandit_params bp
-    on bp.user_id  = me.user_id
-   and bp.platform = p_platform
-   and bp.dow      = p_dow
-   and bp.hour     = p_hour
-),
+  if v_prior_time is null then
+    v_prior_time := 0.20; -- fallback if no prior row
+  end if;
 
--- 2) Content-based score from your posterior engagement
-content as (
-  select
-    v.posterior_engagement_rate as content_score
+  -- 2) BANDIT: if we have learned bandit params, blend them with prior
+  select bp.bandit_alpha::numeric, bp.bandit_beta::numeric
+  into v_bandit_alpha, v_bandit_beta
+  from public.v_bandit_params bp
+  where bp.user_id  = v_user_id
+    and bp.platform = p_platform
+    and bp.dow      = p_dow
+    and bp.hour     = p_hour
+  limit 1;
+
+  if v_bandit_alpha is not null
+     and v_bandit_beta is not null
+     and (v_bandit_alpha + v_bandit_beta) > 0 then
+    v_bandit_mean := v_bandit_alpha / (v_bandit_alpha + v_bandit_beta);
+    v_time_score := 0.7 * v_prior_time + 0.3 * v_bandit_mean;
+  else
+    v_time_score := v_prior_time;
+  end if;
+
+  -- 3) CONTENT SCORE: from v_content_mix_response if exists
+  select v.posterior_engagement_rate
+  into v_content_score
   from public.v_content_mix_response v
-  join me on v.user_id = me.user_id
-  where v.platform     = p_platform
+  where v.user_id      = v_user_id
+    and v.platform     = p_platform
     and v.content_type = p_post_type
     and v.objective    = p_objective
     and v.angle        = p_angle
-  limit 1
-),
+  limit 1;
 
--- 3) Fallback if you have no history yet: use priors only
-content_fallback as (
-  select
-    coalesce(c.content_score, 0.05::numeric) as content_score
-  from content c
-)
+  if v_content_score is null then
+    v_content_score := 0.05; -- fallback content prior
+  end if;
 
-select
-  twb.time_score,
-  cf.content_score,
-  -- you can change this formula to multiply if you prefer
-  (0.5 * twb.time_score + 0.5 * cf.content_score) as combined_score
-from time_with_bandit twb
-cross join content_fallback cf;
+  -- 4) Combined
+  time_score     := v_time_score;
+  content_score  := v_content_score;
+  combined_score := 0.5 * v_time_score + 0.5 * v_content_score;
+
+  return next;
+end;
 $$;
