@@ -1751,7 +1751,12 @@ declare
   v_post_type  post_type_enum;
   v_segment_id int;
 begin
-  -- 1) Get core info about the scheduled post
+  -- nothing to do if null
+  if p_scheduled_post_id is null then
+    return;
+  end if;
+
+  -- 1) Get scheduled post info
   select
     user_id,
     platform,
@@ -1765,15 +1770,17 @@ begin
   from public.scheduled_posts
   where id = p_scheduled_post_id;
 
-  -- If it hasn't actually been posted yet, nothing to record
-  if v_posted_at is null then
+  -- bail if not posted / not found
+  if v_user_id is null
+     or v_platform is null
+     or v_posted_at is null then
     return;
   end if;
 
-  v_weekday := extract(dow from v_posted_at)::int;
+  v_weekday := extract(dow  from v_posted_at)::int;
   v_hour    := extract(hour from v_posted_at)::int;
 
-  -- 2) Compute reward + segment info from features_engagement_timeslots
+  -- 2) Compute reward & segment from features_engagement_timeslots
   select
     label_engagement,
     audience_segment_id
@@ -1787,12 +1794,11 @@ begin
   order by id desc
   limit 1;
 
-  -- No features => no reward
   if v_reward is null then
     return;
   end if;
 
-  -- 3) Upsert the appropriate bandit context (segment + post_type aware)
+  -- 3) Upsert bandit context
   v_ctx_id := public.upsert_bandit_context(
     v_user_id,
     v_platform,
@@ -1802,7 +1808,7 @@ begin
     v_post_type
   );
 
-  -- 4) Log the reward (idempotently per scheduled_post_id)
+  -- 4) Log reward in a best-effort, idempotent way
   insert into public.bandit_rewards (
     user_id,
     context_id,
@@ -1814,9 +1820,11 @@ begin
     p_scheduled_post_id,
     v_reward
   )
-  on conflict (scheduled_post_id) do nothing;  -- idempotent
+  on conflict do nothing;  -- no target: no specific unique index required
+
 end;
 $$;
+
 
 
 -- Trigger fn: record bandit reward when a schedule transitions to 'posted'
@@ -1839,14 +1847,7 @@ begin
 end;
 $$;
 
-drop trigger if exists trg_sched_posts_record_bandit on public.scheduled_posts;
-
-create trigger trg_sched_posts_record_bandit
-after update of status on public.scheduled_posts
-for each row
-execute function public.trg_sched_posts_record_bandit();
-
-create unique index if not exists uq_bandit_rewards_sched
+create unique index uq_bandit_rewards_sched
   on public.bandit_rewards(scheduled_post_id)
   where scheduled_post_id is not null;
 
@@ -2013,10 +2014,17 @@ create table if not exists public.brand_profiles (
   industry industry_enum not null default 'other',
   brand_name text,
   goals jsonb,             -- e.g. {"awareness": 0.4, "engagement": 0.4, "sales": 0.2}
-  target_audience jsonb,   -- free-form description / segments
+  target_audience jsonb,  
+  platform platform_enum not null default 'facebook',
+  page_id text,
+  id uuid default gen_random_uuid() not null,
   created_at timestamptz not null default now_utc(),
-  updated_at timestamptz not null default now_utc()
+  updated_at timestamptz not null default now_utc(),
+  constraint brand_profiles_pkey primary key (id)
 );
+
+create unique index if not exists uq_brand_profiles_user_platform_page
+  on public.brand_profiles (user_id, platform, page_id);
 
 alter table public.brand_profiles enable row level security;
 
@@ -2616,4 +2624,98 @@ select
 from ranked
 order by slot_index
 limit p_n_slots;
+$$;
+
+create or replace function public.simulate_post_scenario(
+  p_platform   platform_enum,
+  p_dow        int,               -- 0=Sun..6=Sat
+  p_hour       int,               -- 0..23
+  p_post_type  post_type_enum,
+  p_objective  text,
+  p_angle      text
+)
+returns table (
+  time_score      numeric,
+  content_score   numeric,
+  combined_score  numeric
+)
+language sql
+security definer
+set search_path = public
+as $$
+with me as (
+  select auth.uid() as user_id
+),
+
+-- 1) Time-based score (global + industry-specific prior)
+brand as (
+  select
+    bp.user_id,
+    bp.industry
+  from public.brand_profiles bp
+  join me on me.user_id = bp.user_id
+),
+
+time_base as (
+  select
+    ghp.prior_score as prior_score
+  from public.global_hourly_priors ghp
+  join brand b
+    on b.industry = ghp.industry
+  where ghp.platform = p_platform
+    and ghp.dow      = p_dow
+    and ghp.hour     = p_hour
+  limit 1
+),
+
+time_with_bandit as (
+  select
+    coalesce(tb.prior_score, 0.2::numeric) as prior_score,
+    bp.bandit_alpha,
+    bp.bandit_beta,
+    case
+      when bp.bandit_alpha is null or bp.bandit_beta is null then
+        coalesce(tb.prior_score, 0.2::numeric)
+      else
+        -- blend prior + learned bandit mean
+        0.7 * coalesce(tb.prior_score, 0.2::numeric)
+        + 0.3 * (bp.bandit_alpha::numeric /
+                 nullif(bp.bandit_alpha + bp.bandit_beta, 0))
+    end as time_score
+  from time_base tb
+  cross join me
+  left join public.v_bandit_params bp
+    on bp.user_id  = me.user_id
+   and bp.platform = p_platform
+   and bp.dow      = p_dow
+   and bp.hour     = p_hour
+),
+
+-- 2) Content-based score from your posterior engagement
+content as (
+  select
+    v.posterior_engagement_rate as content_score
+  from public.v_content_mix_response v
+  join me on v.user_id = me.user_id
+  where v.platform     = p_platform
+    and v.content_type = p_post_type
+    and v.objective    = p_objective
+    and v.angle        = p_angle
+  limit 1
+),
+
+-- 3) Fallback if you have no history yet: use priors only
+content_fallback as (
+  select
+    coalesce(c.content_score, 0.05::numeric) as content_score
+  from content c
+)
+
+select
+  twb.time_score,
+  cf.content_score,
+  -- you can change this formula to multiply if you prefer
+  (0.5 * twb.time_score + 0.5 * cf.content_score) as combined_score
+from time_with_bandit twb
+cross join content_fallback cf;
 $$;

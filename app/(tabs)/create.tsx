@@ -1273,6 +1273,24 @@ export default function CreateScreen() {
           </View>
         ) : null}
 
+        {/* What-If Comparison */}
+          <View style={styles.section}>
+            <Text style={styles.sectionLabel}>Compare Scenarios</Text>
+
+            <TouchableOpacity
+              onPress={() => router.push("/post/compare")}
+              activeOpacity={0.9}
+              style={styles.compareBtn}
+            >
+              <FontAwesome name="bar-chart" size={14} color="#fff" />
+              <Text style={styles.compareBtnText}>What-If Comparison</Text>
+            </TouchableOpacity>
+
+            <Text style={{ color: MUTED, fontSize: 11, marginTop: 4 }}>
+              Simulate performance for different hours, content types, or angles.
+            </Text>
+          </View>
+
         {/* Scheduler */}
         <View style={styles.section}>
           <View style={styles.rowBetween}>
@@ -2016,4 +2034,20 @@ const styles = StyleSheet.create({
     fontSize: 15,
     marginRight: "auto",
   },
+
+  compareBtn: {
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 8,
+  backgroundColor: "#111827",
+  paddingVertical: 12,
+  paddingHorizontal: 14,
+  borderRadius: 12,
+},
+compareBtnText: {
+  color: "#fff",
+  fontWeight: "800",
+  fontSize: 14,
+},
 });
