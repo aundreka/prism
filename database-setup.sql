@@ -2645,7 +2645,7 @@ set search_path = public
 as $$
 declare
   v_user_id         uuid;
-  v_industry        text;
+  v_industry        industry_enum;
   v_prior_time      numeric := 0.20; -- default time prior
   v_bandit_alpha    numeric;
   v_bandit_beta     numeric;
@@ -2673,8 +2673,8 @@ begin
     and ghp.dow = p_dow
     and ghp.hour = p_hour
     and (
-      (v_industry is not null and ghp.industry = v_industry)
-      or (v_industry is null)
+      v_industry is null
+      or ghp.industry = v_industry
     )
   order by
     case when v_industry is not null and ghp.industry = v_industry then 0 else 1 end

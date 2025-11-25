@@ -11,17 +11,25 @@ import React, {
 import {
   ActivityIndicator,
   Alert,
+  Modal,
+  Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
+import DateTimePicker from "@react-native-community/datetimepicker";
 
 /* -------------------------
    Angles config
 --------------------------*/
-import { getAngleByKey, AngleKey } from "@/config/angles";
+import {
+  ANGLE_CATEGORIES,
+  getAngleByKey,
+  AngleKey,
+} from "@/config/angles";
 
 /* -------------------------
    Theme
@@ -36,7 +44,7 @@ const HEADER_SPACER = 120;
 const FOOTER_SPACER = 80;
 
 /* -------------------------
-   Types (schema mirror)
+   Types
 --------------------------*/
 type PlatformEnum = "facebook";
 type PostTypeEnum =
@@ -75,14 +83,13 @@ const DOW_OPTIONS = [
   { value: 6, label: "Sat" },
 ];
 
-// Curated hours to reduce clutter (you can expand later if you want)
-const HOUR_OPTIONS = [7, 9, 12, 15, 18, 20, 21];
-
 const POST_TYPE_OPTIONS: { value: PostTypeEnum; label: string }[] = [
   { value: "image", label: "Image" },
   { value: "video", label: "Video" },
   { value: "reel", label: "Reel" },
   { value: "carousel", label: "Carousel" },
+  { value: "story", label: "Story" },
+  { value: "link", label: "Link" },
 ];
 
 const OBJECTIVE_OPTIONS: { value: ObjectiveEnum; label: string }[] = [
@@ -90,15 +97,6 @@ const OBJECTIVE_OPTIONS: { value: ObjectiveEnum; label: string }[] = [
   { value: "engagement", label: "Engagement" },
   { value: "conversion", label: "Conversion" },
 ];
-
-const BASIC_ANGLE_KEYS: AngleKey[] = [
-  "how_to",
-  "testimonial",
-  "promo",
-  "before_after",
-  "faq",
-  "story",
-] as AngleKey[];
 
 function formatHourLabel(hour: number) {
   const h = ((hour % 24) + 24) % 24;
@@ -156,13 +154,62 @@ export default function CompareScreen() {
   // which scenario's filters are expanded
   const [expanded, setExpanded] = useState<"A" | "B" | null>("A");
 
-  const basicAngles = useMemo(
+  // time picker state
+  const [timePickerVisible, setTimePickerVisible] = useState(false);
+  const [timePickerScenario, setTimePickerScenario] = useState<
+    "A" | "B" | null
+  >(null);
+  const [tempTime, setTempTime] = useState<Date>(new Date());
+
+  // angle modal state
+  const [angleModalVisible, setAngleModalVisible] = useState(false);
+  const [angleModalScenario, setAngleModalScenario] = useState<
+    "A" | "B" | null
+  >(null);
+
+  const allAngles = useMemo(
     () =>
-      BASIC_ANGLE_KEYS.map((k) => getAngleByKey(k)).filter(
-        (a): a is { key: AngleKey; label: string } => !!a
+      ANGLE_CATEGORIES.flatMap((cat) =>
+        cat.angles.map((a) => ({
+          ...a,
+          category: cat.label,
+        }))
       ),
     []
   );
+
+  const openTimePicker = (label: "A" | "B", s: ScenarioInput) => {
+    const d = new Date();
+    d.setHours(s.hour, 0, 0, 0);
+    setTempTime(d);
+    setTimePickerScenario(label);
+    setTimePickerVisible(true);
+  };
+
+  const applyTimePicker = (d: Date) => {
+    const hour = d.getHours();
+    if (timePickerScenario === "A") {
+      setScenarioA((prev) => ({ ...prev, hour }));
+    } else if (timePickerScenario === "B") {
+      setScenarioB((prev) => ({ ...prev, hour }));
+    }
+    setTimePickerVisible(false);
+    setTimePickerScenario(null);
+  };
+
+  const onTimeChange = (_: any, d?: Date) => {
+    if (!d) {
+      if (Platform.OS !== "ios") {
+        setTimePickerVisible(false);
+        setTimePickerScenario(null);
+      }
+      return;
+    }
+    setTempTime(d);
+    if (Platform.OS === "android") {
+      applyTimePicker(d);
+    }
+  };
 
   const runComparison = useCallback(async () => {
     try {
@@ -198,7 +245,7 @@ export default function CompareScreen() {
       if (!rowA && !rowB) {
         Alert.alert(
           "No data yet",
-          "There is not enough engagement history to simulate these scenarios. Try posting more first."
+          "There is not enough engagement history to simulate these scenarios."
         );
         return;
       }
@@ -206,7 +253,6 @@ export default function CompareScreen() {
       setScoreA(rowA);
       setScoreB(rowB);
 
-      // Scroll to results so it feels responsive
       setTimeout(() => {
         scrollRef.current?.scrollToEnd({ animated: true });
       }, 150);
@@ -235,9 +281,6 @@ export default function CompareScreen() {
     return "Both scenarios are expected to perform similarly.";
   }, [scoreA, scoreB]);
 
-  /* -------------------------
-     Small helper renderers
-  --------------------------*/
   const renderChipRow = (
     options: { value: any; label: string }[],
     selected: any,
@@ -264,29 +307,42 @@ export default function CompareScreen() {
     </View>
   );
 
-  const renderAngleRow = (
-    selected: AngleKey,
-    onChange: (v: AngleKey) => void
+  const openAngleModal = (label: "A" | "B") => {
+    setAngleModalScenario(label);
+    setAngleModalVisible(true);
+  };
+
+  const applyAngle = (key: AngleKey) => {
+    if (angleModalScenario === "A") {
+      setScenarioA((prev) => ({ ...prev, angle: key }));
+    } else if (angleModalScenario === "B") {
+      setScenarioB((prev) => ({ ...prev, angle: key }));
+    }
+    setAngleModalVisible(false);
+    setAngleModalScenario(null);
+  };
+
+  const renderSelectorRow = (
+    label: string,
+    value: string,
+    onPress: () => void
   ) => (
-    <View style={styles.chipRowWrap}>
-      {basicAngles.map((opt) => {
-        const active = opt.key === selected;
-        return (
-          <TouchableOpacity
-            key={opt.key}
-            style={[styles.chip, active && styles.chipActive]}
-            onPress={() => onChange(opt.key)}
-            activeOpacity={0.9}
-          >
-            <Text
-              style={[styles.chipText, active && styles.chipTextActive]}
-            >
-              {opt.label}
-            </Text>
-          </TouchableOpacity>
-        );
-      })}
-    </View>
+    <TouchableOpacity
+      style={styles.selectorRow}
+      onPress={onPress}
+      activeOpacity={0.9}
+    >
+      <Text style={styles.selectorLabel}>{label}</Text>
+      <View style={styles.selectorValueWrap}>
+        <Text
+          style={styles.selectorValue}
+          numberOfLines={1}
+        >
+          {value}
+        </Text>
+        <FontAwesome name="chevron-right" size={12} color={MUTED} />
+      </View>
+    </TouchableOpacity>
   );
 
   const renderScenarioCard = (
@@ -296,6 +352,15 @@ export default function CompareScreen() {
     setScenario: React.Dispatch<React.SetStateAction<ScenarioInput>>
   ) => {
     const isExpanded = expanded === label;
+    const angleDef = getAngleByKey(scenario.angle);
+
+    const postTypeLabel =
+      POST_TYPE_OPTIONS.find((p) => p.value === scenario.postType)
+        ?.label ?? scenario.postType;
+
+    const objectiveLabel =
+      OBJECTIVE_OPTIONS.find((o) => o.value === scenario.objective)
+        ?.label ?? scenario.objective;
 
     return (
       <View style={styles.scenarioCard}>
@@ -330,33 +395,54 @@ export default function CompareScreen() {
                 setScenario((prev) => ({ ...prev, dow: v }))
               )}
             </View>
+
             <View style={styles.fieldBlock}>
-              <Text style={styles.fieldLabel}>Hour</Text>
-              {renderChipRow(
-                HOUR_OPTIONS.map((h) => ({
-                  value: h,
-                  label: formatHourLabel(h),
-                })),
-                scenario.hour,
-                (v) => setScenario((prev) => ({ ...prev, hour: v }))
+              {renderSelectorRow(
+                "Time",
+                formatHourLabel(scenario.hour),
+                () => openTimePicker(label, scenario)
               )}
             </View>
+
             <View style={styles.fieldBlock}>
-              <Text style={styles.fieldLabel}>Post type</Text>
-              {renderChipRow(POST_TYPE_OPTIONS, scenario.postType, (v) =>
-                setScenario((prev) => ({ ...prev, postType: v }))
-              )}
+              {renderSelectorRow("Post type", postTypeLabel, () => {
+                const idx = POST_TYPE_OPTIONS.findIndex(
+                  (p) => p.value === scenario.postType
+                );
+                const next =
+                  POST_TYPE_OPTIONS[
+                    (idx + 1 + POST_TYPE_OPTIONS.length) %
+                      POST_TYPE_OPTIONS.length
+                  ];
+                setScenario((prev) => ({
+                  ...prev,
+                  postType: next.value,
+                }));
+              })}
             </View>
+
             <View style={styles.fieldBlock}>
-              <Text style={styles.fieldLabel}>Objective</Text>
-              {renderChipRow(OBJECTIVE_OPTIONS, scenario.objective, (v) =>
-                setScenario((prev) => ({ ...prev, objective: v }))
-              )}
+              {renderSelectorRow("Objective", objectiveLabel, () => {
+                const idx = OBJECTIVE_OPTIONS.findIndex(
+                  (o) => o.value === scenario.objective
+                );
+                const next =
+                  OBJECTIVE_OPTIONS[
+                    (idx + 1 + OBJECTIVE_OPTIONS.length) %
+                      OBJECTIVE_OPTIONS.length
+                  ];
+                setScenario((prev) => ({
+                  ...prev,
+                  objective: next.value,
+                }));
+              })}
             </View>
+
             <View style={styles.fieldBlock}>
-              <Text style={styles.fieldLabel}>Angle</Text>
-              {renderAngleRow(scenario.angle, (v) =>
-                setScenario((prev) => ({ ...prev, angle: v }))
+              {renderSelectorRow(
+                "Angle",
+                angleDef?.label ?? scenario.angle,
+                () => openAngleModal(label)
               )}
             </View>
           </View>
@@ -385,8 +471,8 @@ export default function CompareScreen() {
         </View>
 
         <Text style={styles.subtitle}>
-          Choose two posting scenarios and estimate which one is likely to
-          perform better based on your historical patterns.
+          Compare two posting scenarios based on your learned time patterns and
+          content performance.
         </Text>
 
         {/* Scenario cards */}
@@ -521,6 +607,97 @@ export default function CompareScreen() {
 
         <View style={{ height: FOOTER_SPACER }} />
       </ScrollView>
+
+      {/* Time Picker Modal */}
+      <Modal
+        visible={timePickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTimePickerVisible(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => setTimePickerVisible(false)}
+        />
+        <View style={styles.modalCard}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Pick time</Text>
+            <TouchableOpacity
+              onPress={() => setTimePickerVisible(false)}
+            >
+              <FontAwesome name="times" size={16} color={MUTED} />
+            </TouchableOpacity>
+          </View>
+
+          <DateTimePicker
+            mode="time"
+            display={Platform.OS === "ios" ? "spinner" : "clock"}
+            value={tempTime}
+            onChange={onTimeChange}
+          />
+
+          {Platform.OS === "ios" && (
+            <TouchableOpacity
+              onPress={() => applyTimePicker(tempTime)}
+              style={[styles.runBtn, { marginTop: 10 }]}
+              activeOpacity={0.9}
+            >
+              <Text style={styles.runBtnText}>Done</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </Modal>
+
+      {/* Angle Selector Modal (ALL angles) */}
+      <Modal
+        visible={angleModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAngleModalVisible(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => setAngleModalVisible(false)}
+        />
+        <View style={[styles.modalCard, styles.angleModalCard]}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Select angle</Text>
+            <TouchableOpacity
+              onPress={() => setAngleModalVisible(false)}
+            >
+              <FontAwesome name="times" size={16} color={MUTED} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            style={{ marginTop: 10, maxHeight: 320 }}
+            nestedScrollEnabled
+          >
+            {ANGLE_CATEGORIES.map((cat) => (
+              <View key={cat.id} style={{ marginBottom: 10 }}>
+                <Text style={styles.angleCategoryLabel}>
+                  {cat.label}
+                </Text>
+                {cat.description ? (
+                  <Text style={styles.angleCategoryDesc}>
+                    {cat.description}
+                  </Text>
+                ) : null}
+                {cat.angles.map((a) => (
+                  <TouchableOpacity
+                    key={a.key}
+                    style={styles.angleRowItem}
+                    onPress={() => applyAngle(a.key)}
+                    activeOpacity={0.9}
+                  >
+                    <Text style={styles.angleLabel}>{a.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -643,6 +820,32 @@ const styles = StyleSheet.create({
     color: "#F9FAFB",
   },
 
+  selectorRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    justifyContent: "space-between",
+  },
+  selectorLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: TEXT,
+  },
+  selectorValueWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    maxWidth: "70%",
+    gap: 6,
+  },
+  selectorValue: {
+    fontSize: 11,
+    color: MUTED,
+  },
+
   runRow: {
     marginTop: 18,
   },
@@ -725,5 +928,64 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontSize: 11,
     color: MUTED,
+  },
+
+  // Modals
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.25)",
+  },
+  modalCard: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    bottom: 24,
+    backgroundColor: "#fff",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    padding: 12,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  angleModalCard: {
+    maxHeight: "75%",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  modalTitle: {
+    color: TEXT,
+    fontWeight: "800",
+    fontSize: 15,
+    marginRight: "auto",
+  },
+
+  angleCategoryLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: TEXT,
+    marginBottom: 2,
+  },
+  angleCategoryDesc: {
+    fontSize: 11,
+    color: MUTED,
+    marginBottom: 4,
+  },
+  angleRowItem: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: "#F9FAFB",
+    marginBottom: 4,
+  },
+  angleLabel: {
+    fontSize: 12,
+    color: TEXT,
+    fontWeight: "600",
   },
 });
